@@ -1,21 +1,3 @@
-# gwim
-
-`gwim` is a Go library that simplifies Windows Integrated Authentication (Kerberos and NTLM) for Go web servers.
-
-## API
-
-The `gwim` package provides the following functions:
-
-- `NewSSPIHandler(next http.Handler, useNTLM bool) (http.Handler, error)`: Creates an authentication middleware that wraps an existing `http.Handler`.
-- `ConfigureNTLM(server *http.Server)`: Configures an `http.Server` for NTLM authentication.
-- `ConfigureTLS(server *http.Server, certSubject string) error`: Configures an `http.Server` with a TLS certificate from the Windows certificate store.
-- `User(r *http.Request) (string, []string, bool)`: Extracts the authenticated user's username and group memberships from the request context.
-
-## Usage
-
-Here is an example of how to use `gwim` to create a secure web server:
-
-```go
 package main
 
 import (
@@ -25,7 +7,6 @@ import (
 	"net/http"
 
 	"github.com/akennis/gwim"
-	"github.com/akennis/gwim/auth"
 )
 
 func main() {
@@ -44,11 +25,6 @@ func main() {
 	}
 
 	useNTLM := *serverAddr == "localhost"
-	ldapServerInfo := auth.LdapServerInfo{
-		Address:           *ldapAddress,
-		UsersDN:           *ldapUsersDN,
-		ServiceAccountSPN: *ldapServiceAccountSPN,
-	}
 
 	// Initialize router
 	router := http.NewServeMux()
@@ -59,7 +35,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create SSPI handler: %v", err)
 	}
-	handler = auth.LdapGroupProvider(ldapServerInfo)(handler)
+	handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN)
 
 	// Configure HTTPS server
 	srv := &http.Server{
@@ -91,25 +67,3 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Fprintf(w, "Hello, %s! Your LDAP groups are: %v", username, groups)
 }
-```
-
-To run the secure Windows server example, you need to provide the following required flags:
-
-```bash
-go run examples/sec-win-server.go \
-    --server-addr <server_address> \
-    --secure-server-port <port> \
-    --cert-subject <certificate_subject> \
-    --ldap-address <ldap_server_address> \
-    --ldap-users-dn <ldap_users_dn> \
-    --ldap-service-account-spn <ldap_service_account_spn>
-```
-
-### Flags
-
-- `server-addr`: The address the server will listen on.
-- `secure-server-port`: The port the secure server will listen on.
-- `cert-subject`: The subject of the certificate to use.
-- `ldap-address`: The address of the LDAP server.
-- `ldap-users-dn`: The DN for users in the LDAP server.
-- `ldap-service-account-spn`: The SPN for the service account in the LDAP server.
