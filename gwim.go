@@ -43,6 +43,15 @@ func UserGroups(r *http.Request) ([]string, bool) {
 	return groups, true
 }
 
+// SetUserGroups adds the user's group memberships to the request context and
+// returns the modified request. This allows an application to manage group
+// caching itself and inject the groups into the context, bypassing the need for
+// the LdapGroupProvider to perform a query.
+func SetUserGroups(r *http.Request, groups []string) *http.Request {
+	ctx := context.WithValue(r.Context(), auth.ContextKeyUserGroups, groups)
+	return r.WithContext(ctx)
+}
+
 // NewSSPIHandler returns a new http.Handler that authenticates requests
 // using Kerberos or NTLM, and then calls the next handler in the chain.
 // The useNTLM boolean determines which authentication method to use.

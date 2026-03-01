@@ -176,6 +176,12 @@ func LdapGroupProvider(ldapServerInfo LdapServerInfo) func(next http.Handler) ht
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// If groups are already in the context, do nothing.
+			if _, ok := r.Context().Value(ContextKeyUserGroups).([]string); ok {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			username, ok := r.Context().Value(ContextKeyUsername).(string)
 			if !ok || username == "" {
 				// This should not happen if SPNEGOMiddleware is working, but we check for safety.

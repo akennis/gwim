@@ -16,8 +16,10 @@ import (
 // --- Session Management ---
 
 type Session struct {
-	Username string
-	Expiry   time.Time
+	Username     string
+	Expiry       time.Time
+	Groups       []string
+	GroupsExpiry time.Time
 }
 
 var (
@@ -44,8 +46,8 @@ func newSession(username string) string {
 	return id
 }
 
-// getSession returns the username from the session store if the session is valid.
-func getSession(sessionID string) (string, bool) {
+// getSession returns the session from the session store if the session is valid.
+func getSession(sessionID string) (Session, bool) {
 	sessionMutex.RLock()
 	defer sessionMutex.RUnlock()
 	session, found := sessionStore[sessionID]
@@ -59,9 +61,21 @@ func getSession(sessionID string) (string, bool) {
 				log.Printf("Cleaned up expired session %s", sessionID)
 			}()
 		}
-		return "", false
+		return Session{}, false
 	}
-	return session.Username, true
+	return session, true
+}
+
+// updateSessionWithGroups updates the session store with the user's group memberships.
+func updateSessionWithGroups(sessionID string, groups []string) {
+	sessionMutex.Lock()
+	defer sessionMutex.Unlock()
+	if session, found := sessionStore[sessionID]; found {
+		session.Groups = groups
+		session.GroupsExpiry = time.Now().Add(5 * time.Minute)
+		sessionStore[sessionID] = session
+		log.Printf("Cached groups for user %s in session %s", session.Username, sessionID)
+	}
 }
 
 // --- HTTP Middleware ---
@@ -77,7 +91,7 @@ func sessionMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		username, ok := getSession(cookie.Value)
+		session, ok := getSession(cookie.Value)
 		if !ok {
 			// Invalid or expired session, clear cookie and proceed to authentication
 			http.SetCookie(w, &http.Cookie{Name: sessionCookieName, MaxAge: -1})
@@ -86,36 +100,56 @@ func sessionMiddleware(next http.Handler) http.Handler {
 		}
 
 		// Valid session found, set user in context
-		log.Printf("Found valid session for user %s", username)
-		r = gwim.SetUser(r, username)
+		log.Printf("Found valid session for user %s", session.Username)
+		r = gwim.SetUser(r, session.Username)
+
+		// If the session has valid cached groups, inject them into the context
+		if session.Groups != nil && time.Now().Before(session.GroupsExpiry) {
+			log.Printf("Found valid cached groups for user %s", session.Username)
+			r = gwim.SetUserGroups(r, session.Groups)
+		}
+
 		next.ServeHTTP(w, r)
 	})
 }
 
-// sessionPostAuthMiddleware runs after authentication. If a user was just authenticated
-// (i.e., they have a username but no session yet), it creates a session for them.
+// sessionPostAuthMiddleware runs after authentication and after the LDAP group
+// provider. It creates a session for a newly authenticated user and caches any
+// group memberships that were just fetched.
 func sessionPostAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check if a session cookie already exists. If so, do nothing.
-		if _, err := r.Cookie(sessionCookieName); err == nil {
-			next.ServeHTTP(w, r)
-			return
+		// First, handle session creation if needed.
+		// This happens if a user was just authenticated and has no session cookie.
+		if _, err := r.Cookie(sessionCookieName); err != nil {
+			if username, ok := gwim.User(r); ok {
+				// User was authenticated, create a session for them.
+				sessionID := newSession(username)
+				http.SetCookie(w, &http.Cookie{
+					Name:     sessionCookieName,
+					Value:    sessionID,
+					Expires:  time.Now().Add(sessionTTL),
+					HttpOnly: true,
+					Secure:   true,
+					SameSite: http.SameSiteLaxMode,
+				})
+				// The request cookie jar is not updated automatically
+				r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionID})
+			}
 		}
 
-		// Check if authentication just completed by looking for the username.
-		username, ok := gwim.User(r)
-		if ok {
-			// User was authenticated, create a session for them.
-			sessionID := newSession(username)
-			http.SetCookie(w, &http.Cookie{
-				Name:     sessionCookieName,
-				Value:    sessionID,
-				Expires:  time.Now().Add(sessionTTL),
-				HttpOnly: true,
-				Secure:   true,
-				SameSite: http.SameSiteLaxMode,
-			})
+		// Now, handle group caching.
+		// This happens after the LdapGroupProvider has run.
+		if cookie, err := r.Cookie(sessionCookieName); err == nil {
+			if session, ok := getSession(cookie.Value); ok {
+				// If the session doesn't have groups or they are expired, check the context.
+				if session.Groups == nil || time.Now().After(session.GroupsExpiry) {
+					if groups, ok := gwim.UserGroups(r); ok {
+						updateSessionWithGroups(cookie.Value, groups)
+					}
+				}
+			}
 		}
+
 		next.ServeHTTP(w, r)
 	})
 }
@@ -144,13 +178,13 @@ func main() {
 	// --- Apply Middleware (in reverse order of actual execution) ---
 	var handler http.Handler = router
 
+	// Post-Auth Session Creator: If SSPI just ran, this creates the session.
+	handler = sessionPostAuthMiddleware(handler)
+
 	// LDAP Group Provider: Enriches context with group info (runs after auth).
 	if *ldapAddress != "" {
 		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN)
 	}
-
-	// Post-Auth Session Creator: If SSPI just ran, this creates the session.
-	handler = sessionPostAuthMiddleware(handler)
 
 	// SSPI Handler: Performs Kerberos/NTLM auth if no user is in the context.
 	handler, err := gwim.NewSSPIHandler(handler, useNTLM)
