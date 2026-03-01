@@ -102,6 +102,12 @@ func NtlmAuthn(serverCreds *sspi.Credentials) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// If the username is already in the context, skip authentication
+			if _, ok := r.Context().Value(ContextKeyUsername).(string); ok {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			authHeader := r.Header.Get(AUTHORIZATION)
 			var token64 string
 			if strings.HasPrefix(authHeader, NTLM_SPC) {

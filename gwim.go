@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 
 	"github.com/akennis/gwim/auth"
@@ -13,19 +14,33 @@ import (
 	"github.com/alexbrainman/sspi"
 )
 
-// User returns the username and groups from the request context.
-// The username is a string, and the groups are a slice of strings.
+// User returns the username from the request context.
 // The second return value is true if the user was found in the context.
-func User(r *http.Request) (string, []string, bool) {
+func User(r *http.Request) (string, bool) {
 	username, ok := r.Context().Value(auth.ContextKeyUsername).(string)
-	if !ok {
-		return "", nil, false
+	if !ok || username == "" {
+		return "", false
 	}
+	return username, true
+}
+
+// SetUser adds the username to the request context and returns the modified request.
+// This allows an application to manage sessions itself and inject the user's
+// identity into the context, bypassing the need for per-request authentication.
+func SetUser(r *http.Request, username string) *http.Request {
+	username = strings.ToLower(strings.Split(username, "@")[0])
+	ctx := context.WithValue(r.Context(), auth.ContextKeyUsername, username)
+	return r.WithContext(ctx)
+}
+
+// UserGroups returns the user's groups from the request context.
+// The second return value is true if the groups were found in the context.
+func UserGroups(r *http.Request) ([]string, bool) {
 	groups, ok := r.Context().Value(auth.ContextKeyUserGroups).([]string)
 	if !ok {
-		return username, nil, false
+		return nil, false
 	}
-	return username, groups, true
+	return groups, true
 }
 
 // NewSSPIHandler returns a new http.Handler that authenticates requests
