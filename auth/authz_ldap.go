@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 
@@ -24,8 +25,26 @@ func connect(l LdapServerInfo) (*ldap.Conn, error) {
 	if len(l.Address) == 0 {
 		return nil, fmt.Errorf("ldap address not specified")
 	}
-	tlsConfig := tls.Config{}
-	conn, err := ldap.DialTLS("tcp", l.Address, &tlsConfig)
+
+	host, _, err := net.SplitHostPort(l.Address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse LDAP address: %w", err)
+	}
+
+	// The tls.Config is intentionally left with a nil RootCAs. As of Go 1.18,
+	// Certificate.Verify uses platform APIs to verify certificates when the
+	// Roots field is nil. On Windows, this prompts the crypto/x509 package
+	// to load the trusted root certificates directly from the Windows system
+	// certificate store. This ensures that the LDAP server's certificate is
+	// validated against the CAs trusted by the host OS, which is the idiomatic
+	// way to prevent Man-in-the-Middle (MITM) attacks on Windows.
+	// For more details, see the crypto/x509 section of the Go 1.18 release notes:
+	// https://go.dev/doc/go1.18#crypto/x509
+	tlsConfig := &tls.Config{
+		ServerName: host,
+	}
+
+	conn, err := ldap.DialTLS("tcp", l.Address, tlsConfig)
 	if err != nil {
 		return nil, err
 	}

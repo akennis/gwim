@@ -44,22 +44,22 @@ func main() {
 	}
 
 	useNTLM := *serverAddr == "localhost"
-	ldapServerInfo := auth.LdapServerInfo{
-		Address:           *ldapAddress,
-		UsersDN:           *ldapUsersDN,
-		ServiceAccountSPN: *ldapServiceAccountSPN,
-	}
 
 	// Initialize router
 	router := http.NewServeMux()
 	router.HandleFunc("/", rootHandler)
 
 	// --- Apply Middleware ---
-	handler, err := gwim.NewSSPIHandler(router, useNTLM)
+	var handler http.Handler = router
+	var err error
+	if *ldapAddress != "" {
+		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN)
+	}
+	handler, err = gwim.NewSSPIHandler(handler, useNTLM)
 	if err != nil {
 		log.Fatalf("Failed to create SSPI handler: %v", err)
 	}
-	handler = auth.LdapGroupProvider(ldapServerInfo)(handler)
+
 
 	// Configure HTTPS server
 	srv := &http.Server{
@@ -84,12 +84,18 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	username, groups, ok := gwim.User(r)
+	username, ok := gwim.User(r)
 	if !ok {
+		// This should theoretically not be reached if middleware is correct
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	fmt.Fprintf(w, "Hello, %s! Your LDAP groups are: %v", username, groups)
+	groups, _ := gwim.UserGroups(r)
+	if len(groups) > 0 {
+		fmt.Fprintf(w, "Hello, %s! Your LDAP groups are: %v", username, groups)
+	} else {
+		fmt.Fprintf(w, "Hello, %s! You have a valid session.", username)
+	}
 }
 ```
 
