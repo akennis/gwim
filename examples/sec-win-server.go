@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"flag"
@@ -29,6 +30,8 @@ var (
 )
 
 const sessionCookieName = "sec-win-server-session"
+
+const sessionAuthKey = "session-authenticated"
 
 // newSession creates a new session for the given username and returns the session ID.
 func newSession(username string) string {
@@ -66,6 +69,36 @@ func getSession(sessionID string) (Session, bool) {
 	return session, true
 }
 
+// regenerateSession clears the old session and creates a new one for the user. It returns the new session ID.
+func regenerateSession(w http.ResponseWriter, r *http.Request, username string) string {
+	// If a cookie exists, delete the old session it points to.
+	if oldCookie, err := r.Cookie(sessionCookieName); err == nil {
+		sessionMutex.Lock()
+		delete(sessionStore, oldCookie.Value)
+		sessionMutex.Unlock()
+		log.Printf("Regenerating session: Deleted old session %s", oldCookie.Value)
+	}
+
+	// Create a new session.
+	sessionID := newSession(username)
+
+	// Set the new session cookie.
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    sessionID,
+		Expires:  time.Now().Add(sessionTTL),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	// Update the request's cookie jar so subsequent middleware sees the new session.
+	r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionID})
+
+	log.Printf("Regenerated session: New session is %s for user %s", sessionID, username)
+	return sessionID
+}
+
 // updateSessionWithGroups updates the session store with the user's group memberships.
 func updateSessionWithGroups(sessionID string, groups []string) {
 	sessionMutex.Lock()
@@ -84,9 +117,11 @@ func updateSessionWithGroups(sessionID string, groups []string) {
 // user into the context, allowing the SSPI handler to be skipped.
 func sessionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("AUTHN/Z: [%s] Request received. Entering session middleware.", r.RemoteAddr)
 		cookie, err := r.Cookie(sessionCookieName)
 		if err != nil {
 			// No cookie, proceed to authentication
+			log.Printf("AUTHN/Z: [%s] No session cookie. Proceeding to SSPI authentication.", r.RemoteAddr)
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -94,18 +129,21 @@ func sessionMiddleware(next http.Handler) http.Handler {
 		session, ok := getSession(cookie.Value)
 		if !ok {
 			// Invalid or expired session, clear cookie and proceed to authentication
+			log.Printf("AUTHN/Z: [%s] Invalid or expired session. Proceeding to SSPI authentication.", r.RemoteAddr)
 			http.SetCookie(w, &http.Cookie{Name: sessionCookieName, MaxAge: -1})
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		// Valid session found, set user in context
-		log.Printf("Found valid session for user %s", session.Username)
+		log.Printf("AUTHN/Z: [%s] Found valid session for user '%s'. Skipping SSPI.", r.RemoteAddr, session.Username)
 		r = gwim.SetUser(r, session.Username)
+		// Mark in the context that authentication came from a valid session.
+		r = r.WithContext(context.WithValue(r.Context(), sessionAuthKey, true))
 
 		// If the session has valid cached groups, inject them into the context
 		if session.Groups != nil && time.Now().Before(session.GroupsExpiry) {
-			log.Printf("Found valid cached groups for user %s", session.Username)
+			log.Printf("AUTHN/Z: [%s] Found valid cached groups for user '%s'.", r.RemoteAddr, session.Username)
 			r = gwim.SetUserGroups(r, session.Groups)
 		}
 
@@ -113,27 +151,22 @@ func sessionMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// sessionPostAuthMiddleware runs after authentication and after the LDAP group
-// provider. It creates a session for a newly authenticated user and caches any
-// group memberships that were just fetched.
+// sessionPostAuthMiddleware runs after authentication. If authentication just
+// occurred (i.e., user is in context but not from an existing session), it
+// regenerates the session to prevent fixation. It also caches group memberships.
 func sessionPostAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// First, handle session creation if needed.
-		// This happens if a user was just authenticated and has no session cookie.
-		if _, err := r.Cookie(sessionCookieName); err != nil {
-			if username, ok := gwim.User(r); ok {
-				// User was authenticated, create a session for them.
-				sessionID := newSession(username)
-				http.SetCookie(w, &http.Cookie{
-					Name:     sessionCookieName,
-					Value:    sessionID,
-					Expires:  time.Now().Add(sessionTTL),
-					HttpOnly: true,
-					Secure:   true,
-					SameSite: http.SameSiteLaxMode,
-				})
-				// The request cookie jar is not updated automatically
-				r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionID})
+		log.Printf("AUTHN/Z: [%s] Entering post-auth middleware.", r.RemoteAddr)
+		// Check if a user was authenticated in this request cycle by the SSPI handler.
+		// We know this if a user exists in the context, but the context wasn't flagged
+		// by the sessionMiddleware.
+		if username, ok := gwim.User(r); ok {
+			log.Printf("AUTHN/Z: [%s] User '%s' present in context.", r.RemoteAddr, username)
+			if authFromSession, _ := r.Context().Value(sessionAuthKey).(bool); !authFromSession {
+				// This was a new login, not a request with an existing session.
+				// Regenerate the session to prevent fixation attacks.
+				log.Printf("AUTHN/Z: [%s] New login detected for user '%s'. Regenerating session.", r.RemoteAddr, username)
+				regenerateSession(w, r, username)
 			}
 		}
 
@@ -143,7 +176,9 @@ func sessionPostAuthMiddleware(next http.Handler) http.Handler {
 			if session, ok := getSession(cookie.Value); ok {
 				// If the session doesn't have groups or they are expired, check the context.
 				if session.Groups == nil || time.Now().After(session.GroupsExpiry) {
+					log.Printf("AUTHN/Z: [%s] Checking for groups to cache for user '%s' in session %s.", r.RemoteAddr, session.Username, cookie.Value)
 					if groups, ok := gwim.UserGroups(r); ok {
+						log.Printf("AUTHN/Z: [%s] Found groups in context for user '%s'. Caching them.", r.RemoteAddr, session.Username)
 						updateSessionWithGroups(cookie.Value, groups)
 					}
 				}
@@ -151,6 +186,7 @@ func sessionPostAuthMiddleware(next http.Handler) http.Handler {
 		}
 
 		next.ServeHTTP(w, r)
+		log.Printf("AUTHN/Z: [%s] Exiting post-auth middleware.", r.RemoteAddr)
 	})
 }
 
@@ -177,13 +213,16 @@ func main() {
 
 	// --- Apply Middleware (in reverse order of actual execution) ---
 	var handler http.Handler = router
+	log.Println("AUTHN/Z: Configuring middleware chain...")
 
 	// Post-Auth Session Creator: If SSPI just ran, this creates the session.
 	handler = sessionPostAuthMiddleware(handler)
+	log.Println("AUTHN/Z: --> Applied post-auth session middleware (runs last)")
 
 	// LDAP Group Provider: Enriches context with group info (runs after auth).
 	if *ldapAddress != "" {
 		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN)
+		log.Println("AUTHN/Z: --> Applied LDAP group provider")
 	}
 
 	// SSPI Handler: Performs Kerberos/NTLM auth if no user is in the context.
@@ -191,9 +230,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create SSPI handler: %v", err)
 	}
+	log.Println("AUTHN/Z: --> Applied SSPI handler (Kerberos/NTLM)")
 
 	// Session Middleware: The first handler to run. Checks for an existing session.
 	handler = sessionMiddleware(handler)
+	log.Println("AUTHN/Z: --> Applied session middleware (runs first)")
 
 	// Configure HTTPS server
 	srv := &http.Server{
@@ -221,10 +262,12 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	username, ok := gwim.User(r)
 	if !ok {
 		// This should theoretically not be reached if middleware is correct
+		log.Printf("AUTHN/Z: [%s] Unauthorized access to root handler without user in context.", r.RemoteAddr)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 	groups, _ := gwim.UserGroups(r)
+	log.Printf("AUTHN/Z: [%s] Root handler reached for user '%s' with groups: %v", r.RemoteAddr, username, groups)
 	if len(groups) > 0 {
 		fmt.Fprintf(w, "Hello, %s! Your LDAP groups are: %v", username, groups)
 	} else {
