@@ -5,7 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"flag"
-	"fmt"
+	"html/template"
 	"log"
 	"net/http"
 	"sync"
@@ -254,6 +254,33 @@ func main() {
 	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
 
+var parsedRootTemplate = template.Must(template.New("root").Parse(`
+<!DOCTYPE html>
+<html>
+<head>
+    <title>GWIM Welcome</title>
+</head>
+<body>
+    <h1>Hello, {{.Username}}!</h1>
+    {{if .Groups}}
+        <p>You have a valid session and belong to the following LDAP groups:</p>
+        <ul>
+            {{range .Groups}}
+                <li>{{.}}</li>
+            {{end}}
+        </ul>
+    {{else}}
+        <p>You have a valid session.</p>
+    {{end}}
+</body>
+</html>
+`))
+
+type rootData struct {
+	Username string
+	Groups   []string
+}
+
 func rootHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -268,9 +295,15 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	groups, _ := gwim.UserGroups(r)
 	log.Printf("AUTHN/Z: [%s] Root handler reached for user '%s' with groups: %v", r.RemoteAddr, username, groups)
-	if len(groups) > 0 {
-		fmt.Fprintf(w, "Hello, %s! Your LDAP groups are: %v", username, groups)
-	} else {
-		fmt.Fprintf(w, "Hello, %s! You have a valid session.", username)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	data := rootData{
+		Username: username,
+		Groups:   groups,
+	}
+	err := parsedRootTemplate.Execute(w, data)
+	if err != nil {
+		log.Printf("ERROR: failed to execute root handler template: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 	}
 }
