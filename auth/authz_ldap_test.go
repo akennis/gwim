@@ -192,7 +192,7 @@ func TestLdapGroupProvider(t *testing.T) {
 			}
 		})
 
-		handler := LdapGroupProvider(serverInfo)(nextHandler)
+		handler := LdapGroupProvider(serverInfo, DefaultAuthOptions())(nextHandler)
 
 		req := httptest.NewRequest("GET", "/", nil)
 		ctx := context.WithValue(req.Context(), ContextKeyUsername, "testuser")

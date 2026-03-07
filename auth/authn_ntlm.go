@@ -66,12 +66,17 @@ func getSSPIUsername(sctxt *sspi.CtxtHandle) (string, error) {
 	return syscall.UTF16ToString((*[2 << 20]uint16)(unsafe.Pointer(n.UserName))[:]), nil
 }
 
-func NtlmAuthn(serverCreds *sspi.Credentials) func(http.Handler) http.Handler {
+func NtlmAuthn(serverCreds *sspi.Credentials, options ...AuthOptions) func(http.Handler) http.Handler {
 	authCache := cache.New(1*time.Minute, 2*time.Minute)
-	return ntlmAuthn(serverCreds, &defaultNtlmProvider{}, authCache)
+	var opts AuthOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	opts.ApplyGeneralError()
+	return ntlmAuthn(serverCreds, &defaultNtlmProvider{}, authCache, opts)
 }
 
-func ntlmAuthn(serverCreds *sspi.Credentials, np ntlmProvider, authCache *cache.Cache) func(http.Handler) http.Handler {
+func ntlmAuthn(serverCreds *sspi.Credentials, np ntlmProvider, authCache *cache.Cache, opts AuthOptions) func(http.Handler) http.Handler {
 	authCache.OnEvicted(func(k string, v interface{}) {
 		if s, ok := v.(ntlmServerContext); ok {
 			s.Release()
@@ -151,13 +156,13 @@ func ntlmAuthn(serverCreds *sspi.Credentials, np ntlmProvider, authCache *cache.
 
 			if token64 == "" {
 				w.Header().Add(WWW_AUTH, NTLM)
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				opts.GetOnUnauthorized()(w, r, fmt.Errorf("missing authentication header"))
 				return
 			}
 
 			clientToken, err := base64.StdEncoding.DecodeString(strings.TrimSpace(token64))
 			if err != nil {
-				http.Error(w, "Invalid Token", http.StatusBadRequest)
+				opts.GetOnInvalidToken()(w, r, err)
 				return
 			}
 
@@ -170,13 +175,13 @@ func ntlmAuthn(serverCreds *sspi.Credentials, np ntlmProvider, authCache *cache.
 				if authID != "" {
 					authCache.Delete(authID)
 				}
-				http.Error(w, "Authentication Failed", http.StatusUnauthorized)
+				opts.GetOnAuthFailed()(w, r, err)
 				return
 			}
 
 			if !authDone {
 				w.Header().Set(WWW_AUTH, NTLM+" "+base64.StdEncoding.EncodeToString(outputToken))
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				opts.GetOnUnauthorized()(w, r, fmt.Errorf("negotiation in progress"))
 				return
 			}
 

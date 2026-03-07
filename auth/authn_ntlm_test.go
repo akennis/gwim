@@ -145,7 +145,7 @@ func TestNtlmAuthn(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			authCache := cache.New(1*time.Minute, 2*time.Minute)
-			handler := ntlmAuthn(nil, tt.mockProvider, authCache)
+			handler := ntlmAuthn(nil, tt.mockProvider, authCache, DefaultAuthOptions())
 			nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				username, _ := r.Context().Value(ContextKeyUsername).(string)
 				if username != tt.expectedUser {

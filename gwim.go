@@ -56,7 +56,7 @@ func SetUserGroups(r *http.Request, groups []string) *http.Request {
 // using Kerberos or NTLM, and then calls the next handler in the chain.
 // The useNTLM boolean determines which authentication method to use.
 // If useNTLM is true, NTLM is used. Otherwise, Kerberos is used.
-func NewSSPIHandler(next http.Handler, useNTLM bool) (http.Handler, error) {
+func NewSSPIHandler(next http.Handler, useNTLM bool, options ...auth.AuthOptions) (http.Handler, error) {
 	serverCreds, err := sspi.AcquireCredentials("", "Negotiate", sspi.SECPKG_CRED_INBOUND, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire credentials for SPNEGO: %w", err)
@@ -64,9 +64,9 @@ func NewSSPIHandler(next http.Handler, useNTLM bool) (http.Handler, error) {
 
 	var handler http.Handler
 	if useNTLM {
-		handler = auth.NtlmAuthn(serverCreds)(next)
+		handler = auth.NtlmAuthn(serverCreds, options...)(next)
 	} else {
-		handler = auth.KerberosAuthn(serverCreds)(next)
+		handler = auth.KerberosAuthn(serverCreds, options...)(next)
 	}
 
 	return handler, nil
@@ -99,11 +99,11 @@ func ConfigureNTLM(server *http.Server) {
 
 // NewLdapGroupProvider returns a new http.Handler that enriches the request context
 // with the user's LDAP groups.
-func NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string) http.Handler {
+func NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, options ...auth.AuthOptions) http.Handler {
 	ldapServerInfo := auth.LdapServerInfo{
 		Address:           ldapAddress,
 		UsersDN:           ldapUsersDN,
 		ServiceAccountSPN: ldapServiceAccountSPN,
 	}
-	return auth.LdapGroupProvider(ldapServerInfo)(next)
+	return auth.LdapGroupProvider(ldapServerInfo, options...)(next)
 }

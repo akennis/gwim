@@ -211,8 +211,13 @@ type ldapConnector func(l LdapServerInfo) (ldapClient, error)
 // currentLdapConnector is the function used to connect to LDAP, can be overridden for testing.
 var currentLdapConnector ldapConnector = connect
 
-func LdapGroupProvider(ldapServerInfo LdapServerInfo) func(next http.Handler) http.Handler {
+func LdapGroupProvider(ldapServerInfo LdapServerInfo, options ...AuthOptions) func(http.Handler) http.Handler {
 	ldapPool := make(chan ldapClient, 10)
+	var opts AuthOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	opts.ApplyGeneralError()
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -225,7 +230,7 @@ func LdapGroupProvider(ldapServerInfo LdapServerInfo) func(next http.Handler) ht
 			username, ok := r.Context().Value(ContextKeyUsername).(string)
 			if !ok || username == "" {
 				// This should not happen if SPNEGOMiddleware is working, but we check for safety.
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				opts.GetOnUnauthorized()(w, r, fmt.Errorf("user not found in context"))
 				return
 			}
 
@@ -251,7 +256,7 @@ func LdapGroupProvider(ldapServerInfo LdapServerInfo) func(next http.Handler) ht
 				// Create a new connection if the pool was empty or the connection from the pool was stale.
 				ldapServiceConn, err = currentLdapConnector(ldapServerInfo)
 				if err != nil {
-					http.Error(w, "LDAP connection problem, defaulting to not authorized", http.StatusInternalServerError)
+					opts.GetOnLdapConnectionError()(w, r, err)
 					return
 				}
 			}
@@ -260,7 +265,7 @@ func LdapGroupProvider(ldapServerInfo LdapServerInfo) func(next http.Handler) ht
 			if err != nil {
 				// On error, close the connection and don't return it to the pool
 				ldapServiceConn.Close()
-				http.Error(w, "LDAP group lookup problem, defaulting to not authorized", http.StatusInternalServerError)
+				opts.GetOnLdapLookupError()(w, r, err)
 				return
 			}
 

@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/akennis/gwim"
+	"github.com/akennis/gwim/auth"
 )
 
 func main() {
@@ -27,7 +28,7 @@ func main() {
 
 	// Initialize router
 	router := http.NewServeMux()
-	router.HandleFunc("/", rootHandler)
+	router.HandleFunc("/", minRootHandler)
 
 	// --- Apply Middleware (in reverse order of actual execution) ---
 	var handler http.Handler = router
@@ -35,13 +36,17 @@ func main() {
 
 	// LDAP Group Provider (Optional): Enriches context with group info.
 	if *ldapAddress != "" {
-		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN)
+		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN, auth.AuthOptions{
+			OnGeneralError: onMinAuthError,
+		})
 		log.Println("AUTHN/Z: --> Applied LDAP group provider")
 	}
 
 	// SSPI Handler: Performs Windows Authentication (Kerberos/NTLM).
 	// This is the core of the gwim API.
-	handler, err := gwim.NewSSPIHandler(handler, useNTLM)
+	handler, err := gwim.NewSSPIHandler(handler, useNTLM, auth.AuthOptions{
+		OnGeneralError: onMinAuthError,
+	})
 	if err != nil {
 		log.Fatalf("Failed to create SSPI handler: %v", err)
 	}
@@ -67,7 +72,42 @@ func main() {
 	log.Fatal(srv.ListenAndServeTLS("", ""))
 }
 
-var parsedRootTemplate = template.Must(template.New("root").Parse(`
+func onMinAuthError(w http.ResponseWriter, r *http.Request, err error) {
+	log.Printf("AUTHN/Z: [%s] Authentication failed: %v", r.RemoteAddr, err)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusUnauthorized)
+	data := struct {
+		Error string
+	}{
+		Error: err.Error(),
+	}
+	if templateErr := minErrorTemplate.Execute(w, data); templateErr != nil {
+		log.Printf("ERROR: failed to execute error handler template: %v", templateErr)
+	}
+}
+
+var minErrorTemplate = template.Must(template.New("error").Parse(`
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Authentication Error</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding-top: 50px; }
+        .error-box { display: inline-block; border: 1px solid #ff0000; padding: 20px; border-radius: 5px; background: #fff5f5; }
+        h1 { color: #cc0000; }
+    </style>
+</head>
+<body>
+    <div class="error-box">
+        <h1>Authentication Failed</h1>
+        <p>An error occurred while trying to authenticate you.</p>
+        <p><strong>Details:</strong> {{.Error}}</p>
+    </div>
+</body>
+</html>
+`))
+
+var minRootTemplate = template.Must(template.New("root").Parse(`
 <!DOCTYPE html>
 <html>
 <head>
@@ -89,12 +129,12 @@ var parsedRootTemplate = template.Must(template.New("root").Parse(`
 </html>
 `))
 
-type rootData struct {
+type minRootData struct {
 	Username string
 	Groups   []string
 }
 
-func rootHandler(w http.ResponseWriter, r *http.Request) {
+func minRootHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
@@ -113,11 +153,11 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("AUTHN/Z: [%s] Root handler reached for user '%s'", r.RemoteAddr, username)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	data := rootData{
+	data := minRootData{
 		Username: username,
 		Groups:   groups,
 	}
-	err := parsedRootTemplate.Execute(w, data)
+	err := minRootTemplate.Execute(w, data)
 	if err != nil {
 		log.Printf("ERROR: failed to execute root handler template: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -24,11 +25,16 @@ func (p *defaultKerberosProvider) NewServerContext(creds *sspi.Credentials, clie
 	return kerberos.NewServerContext(creds, clientToken)
 }
 
-func KerberosAuthn(serverCreds *sspi.Credentials) func(http.Handler) http.Handler {
-	return kerberosAuthn(serverCreds, &defaultKerberosProvider{})
+func KerberosAuthn(serverCreds *sspi.Credentials, options ...AuthOptions) func(http.Handler) http.Handler {
+	var opts AuthOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	opts.ApplyGeneralError()
+	return kerberosAuthn(serverCreds, &defaultKerberosProvider{}, opts)
 }
 
-func kerberosAuthn(serverCreds *sspi.Credentials, kp kerberosProvider) func(http.Handler) http.Handler {
+func kerberosAuthn(serverCreds *sspi.Credentials, kp kerberosProvider, opts AuthOptions) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// If the username is already in the context, skip authentication
@@ -40,30 +46,30 @@ func kerberosAuthn(serverCreds *sspi.Credentials, kp kerberosProvider) func(http
 			authHeader := r.Header.Get(AUTHORIZATION)
 			if !strings.HasPrefix(authHeader, NEGOTIATE_SPC) {
 				w.Header().Set(WWW_AUTH, NEGOTIATE)
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				opts.GetOnUnauthorized()(w, r, fmt.Errorf("missing or invalid authentication header"))
 				return
 			}
 
 			token64 := authHeader[TOKEN_OFFSET:]
 			clientToken, err := base64.StdEncoding.DecodeString(token64)
 			if err != nil {
-				http.Error(w, "Invalid Token", http.StatusBadRequest)
+				opts.GetOnInvalidToken()(w, r, err)
 				return
 			}
 
 			krbCtx, authDone, _, err := kp.NewServerContext(serverCreds, clientToken)
 			if err != nil {
-				http.Error(w, "Authentication Failed", http.StatusUnauthorized)
+				opts.GetOnAuthFailed()(w, r, err)
 				return
 			}
 			if !authDone {
-				http.Error(w, "Authentication Failed", http.StatusUnauthorized)
+				opts.GetOnAuthFailed()(w, r, fmt.Errorf("negotiation in progress"))
 				return
 			}
 
 			username, err := krbCtx.GetUsername()
 			if err != nil {
-				http.Error(w, "Identity Error", http.StatusInternalServerError)
+				opts.GetOnIdentityError()(w, r, err)
 				return
 			}
 			username = strings.Split(username, "@")[0]
