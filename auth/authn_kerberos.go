@@ -10,7 +10,25 @@ import (
 	"github.com/alexbrainman/sspi/kerberos"
 )
 
+type kerberosServerContext interface {
+	GetUsername() (string, error)
+}
+
+type kerberosProvider interface {
+	NewServerContext(creds *sspi.Credentials, clientToken []byte) (kerberosServerContext, bool, []byte, error)
+}
+
+type defaultKerberosProvider struct{}
+
+func (p *defaultKerberosProvider) NewServerContext(creds *sspi.Credentials, clientToken []byte) (kerberosServerContext, bool, []byte, error) {
+	return kerberos.NewServerContext(creds, clientToken)
+}
+
 func KerberosAuthn(serverCreds *sspi.Credentials) func(http.Handler) http.Handler {
+	return kerberosAuthn(serverCreds, &defaultKerberosProvider{})
+}
+
+func kerberosAuthn(serverCreds *sspi.Credentials, kp kerberosProvider) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// If the username is already in the context, skip authentication
@@ -33,7 +51,7 @@ func KerberosAuthn(serverCreds *sspi.Credentials) func(http.Handler) http.Handle
 				return
 			}
 
-			krbCtx, authDone, _, err := kerberos.NewServerContext(serverCreds, clientToken)
+			krbCtx, authDone, _, err := kp.NewServerContext(serverCreds, clientToken)
 			if err != nil {
 				http.Error(w, "Authentication Failed", http.StatusUnauthorized)
 				return
