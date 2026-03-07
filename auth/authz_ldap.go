@@ -21,7 +21,21 @@ type LdapServerInfo struct {
 	ServiceAccountSPN string
 }
 
-func connect(l LdapServerInfo) (*ldap.Conn, error) {
+// ldapClient defines the subset of ldap.Conn methods used by this package,
+// allowing for easier mocking in tests.
+type ldapClient interface {
+	Search(searchRequest *ldap.SearchRequest) (*ldap.SearchResult, error)
+	Close() error
+	TLSConnectionState() (tls.ConnectionState, bool)
+	GSSAPIBind(client ldap.GSSAPIClient, target, password string) error
+}
+
+// ldapWrapper wraps a *ldap.Conn to implement the LdapClient interface.
+type ldapWrapper struct {
+	*ldap.Conn
+}
+
+func connect(l LdapServerInfo) (ldapClient, error) {
 	if len(l.Address) == 0 {
 		return nil, fmt.Errorf("ldap address not specified")
 	}
@@ -44,14 +58,15 @@ func connect(l LdapServerInfo) (*ldap.Conn, error) {
 		ServerName: host,
 	}
 
-	conn, err := ldap.DialTLS("tcp", l.Address, tlsConfig)
+	ldapURL := "ldaps://" + l.Address
+	conn, err := ldap.DialURL(ldapURL, ldap.DialWithTLSConfig(tlsConfig))
 	if err != nil {
 		return nil, err
 	}
 
 	cred, err := kerberos.AcquireCurrentUserCredentials()
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("failed to acquire current user credentials: %v", err)
 	}
 	defer cred.Release()
@@ -65,10 +80,10 @@ func connect(l LdapServerInfo) (*ldap.Conn, error) {
 	client := &sspiGssapiClient{cred: cred, channelBindings: cbt}
 	err = conn.GSSAPIBind(client, l.ServiceAccountSPN, "")
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("LDAP GSSAPI Bind failed: %v", err)
 	}
-	return conn, nil
+	return &ldapWrapper{conn}, nil
 }
 
 func createChannelBindings(certRaw []byte) []byte {
@@ -86,7 +101,7 @@ func createChannelBindings(certRaw []byte) []byte {
 	return buf.Bytes()
 }
 
-func getUserGroups(ldapServiceConn *ldap.Conn, ldapUsersDN string, username string) ([]string, error) {
+func getUserGroups(ldapServiceConn ldapClient, ldapUsersDN string, username string) ([]string, error) {
 	// First, get the user's distinguished name (DN).
 	userSearchRequest := ldap.NewSearchRequest(
 		ldapUsersDN,
@@ -190,8 +205,14 @@ func getUserGroups(ldapServiceConn *ldap.Conn, ldapUsersDN string, username stri
 	return groups, nil
 }
 
+// ldapConnector defines a function type for creating an LDAP connection.
+type ldapConnector func(l LdapServerInfo) (ldapClient, error)
+
+// currentLdapConnector is the function used to connect to LDAP, can be overridden for testing.
+var currentLdapConnector ldapConnector = connect
+
 func LdapGroupProvider(ldapServerInfo LdapServerInfo) func(next http.Handler) http.Handler {
-	ldapPool := make(chan *ldap.Conn, 10)
+	ldapPool := make(chan ldapClient, 10)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -208,7 +229,7 @@ func LdapGroupProvider(ldapServerInfo LdapServerInfo) func(next http.Handler) ht
 				return
 			}
 
-			var ldapServiceConn *ldap.Conn
+			var ldapServiceConn ldapClient
 			var err error
 
 			// Try to get a connection from the pool
@@ -228,7 +249,7 @@ func LdapGroupProvider(ldapServerInfo LdapServerInfo) func(next http.Handler) ht
 
 			if ldapServiceConn == nil {
 				// Create a new connection if the pool was empty or the connection from the pool was stale.
-				ldapServiceConn, err = connect(ldapServerInfo)
+				ldapServiceConn, err = currentLdapConnector(ldapServerInfo)
 				if err != nil {
 					http.Error(w, "LDAP connection problem, defaulting to not authorized", http.StatusInternalServerError)
 					return
