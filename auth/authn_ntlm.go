@@ -11,7 +11,7 @@ import (
 	"unsafe"
 
 	"github.com/alexbrainman/sspi"
-	"github.com/alexbrainman/sspi/negotiate"
+	"github.com/alexbrainman/sspi/ntlm"
 	"github.com/patrickmn/go-cache"
 )
 
@@ -22,6 +22,38 @@ const (
 
 type SecPkgContext_Names struct {
 	UserName *uint16
+}
+
+type ntlmServerContext interface {
+	Update(outDesc, inDesc *sspi.SecBufferDesc) error
+	Release() error
+	GetUsername() (string, error)
+}
+
+type ntlmProvider interface {
+	NewServerContext(creds *sspi.Credentials) ntlmServerContext
+}
+
+type defaultNtlmProvider struct{}
+
+func (p *defaultNtlmProvider) NewServerContext(creds *sspi.Credentials) ntlmServerContext {
+	return &sspiNtlmContext{sspi.NewServerContext(creds, sspi.ASC_REQ_CONNECTION|sspi.ASC_REQ_REPLAY_DETECT)}
+}
+
+type sspiNtlmContext struct {
+	*sspi.Context
+}
+
+func (c *sspiNtlmContext) Update(outDesc, inDesc *sspi.SecBufferDesc) error {
+	return c.Context.Update(nil, outDesc, inDesc)
+}
+
+func (c *sspiNtlmContext) Release() error {
+	return c.Context.Release()
+}
+
+func (c *sspiNtlmContext) GetUsername() (string, error) {
+	return getSSPIUsername(c.Context.Handle)
 }
 
 func getSSPIUsername(sctxt *sspi.CtxtHandle) (string, error) {
@@ -36,21 +68,25 @@ func getSSPIUsername(sctxt *sspi.CtxtHandle) (string, error) {
 
 func NtlmAuthn(serverCreds *sspi.Credentials) func(http.Handler) http.Handler {
 	authCache := cache.New(1*time.Minute, 2*time.Minute)
+	return ntlmAuthn(serverCreds, &defaultNtlmProvider{}, authCache)
+}
+
+func ntlmAuthn(serverCreds *sspi.Credentials, np ntlmProvider, authCache *cache.Cache) func(http.Handler) http.Handler {
 	authCache.OnEvicted(func(k string, v interface{}) {
-		if s, ok := v.(*sspi.Context); ok {
+		if s, ok := v.(ntlmServerContext); ok {
 			s.Release()
 		}
 	})
 
 	handleNTLM := func(clientToken []byte, connID uint64) (string, []byte, bool, error) {
-		var negoCtx *sspi.Context
+		var negoCtx ntlmServerContext
 		var isNewContext bool
 		var authID string
 
 		if connID != 0 {
 			authID = fmt.Sprintf("N%d", connID)
 			if cached, found := authCache.Get(authID); found {
-				if s, ok := cached.(*sspi.Context); ok {
+				if s, ok := cached.(ntlmServerContext); ok {
 					negoCtx = s
 				}
 			}
@@ -58,30 +94,29 @@ func NtlmAuthn(serverCreds *sspi.Credentials) func(http.Handler) http.Handler {
 
 		if negoCtx == nil {
 			isNewContext = true
-			// For NTLM, we need connection-based tracking. REPLAY_DETECT is also good practice.
-			negoCtx = sspi.NewServerContext(serverCreds, sspi.ASC_REQ_CONNECTION|sspi.ASC_REQ_REPLAY_DETECT)
+			negoCtx = np.NewServerContext(serverCreds)
 		}
 
-		outputToken := make([]byte, negotiate.PackageInfo.MaxToken)
+		outputToken := make([]byte, ntlm.PackageInfo.MaxToken)
 		outBuf := sspi.SecBuffer{BufferType: sspi.SECBUFFER_TOKEN, Buffer: &outputToken[0], BufferSize: uint32(len(outputToken))}
 		inBuf := sspi.SecBuffer{BufferType: sspi.SECBUFFER_TOKEN, Buffer: &clientToken[0], BufferSize: uint32(len(clientToken))}
 		outDesc := sspi.NewSecBufferDesc([]sspi.SecBuffer{outBuf})
 		inDesc := sspi.NewSecBufferDesc([]sspi.SecBuffer{inBuf})
 
-		ret := negoCtx.Update(nil, outDesc, inDesc)
-		if ret != sspi.SEC_E_OK && ret != sspi.SEC_I_CONTINUE_NEEDED {
+		err := negoCtx.Update(outDesc, inDesc)
+		if err != sspi.SEC_E_OK && err != sspi.SEC_I_CONTINUE_NEEDED {
 			if isNewContext {
 				negoCtx.Release() // Release if newly created context failed to update
 			}
-			return "", nil, false, ret
+			return "", nil, false, err
 		}
 
-		authDone := (ret == sspi.SEC_E_OK)
+		authDone := (err == sspi.SEC_E_OK)
 		n := outDesc.Buffers.BufferSize
 		outputTokenBytes := outputToken[:n]
 
 		if authDone {
-			username, err := getSSPIUsername(negoCtx.Handle)
+			username, err := negoCtx.GetUsername()
 			if err != nil {
 				negoCtx.Release() // Done with context, release it.
 				return "", nil, true, err
