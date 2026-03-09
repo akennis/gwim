@@ -72,21 +72,11 @@ func NewSSPIHandler(next http.Handler, useNTLM bool, options ...auth.AuthOptions
 	return handler, nil
 }
 
-// ConfigureTLS configures the http.Server with a TLS certificate from the
-// Windows certificate store. The certSubject is the subject of the
-// certificate to use.
-func ConfigureTLS(server *http.Server, certSubject string) error {
-	certificate, err := cert.GetWin32Cert(certSubject)
-	if err != nil {
-		return fmt.Errorf("error loading certificate from Windows store: %w", err)
-	}
-
-	server.TLSConfig = &tls.Config{
-		Certificates: []tls.Certificate{certificate},
-		MinVersion:   tls.VersionTLS13,
-	}
-
-	return nil
+// GetCertificate retrieves a TLS certificate from the Windows certificate store.
+// The certSubject is the subject of the certificate to use. The fromCurrentUser
+// parameter determines whether to search the CurrentUser or LocalMachine store.
+func GetCertificate(certSubject string, fromCurrentUser bool) (tls.Certificate, error) {
+	return cert.GetWin32Cert(certSubject, fromCurrentUser)
 }
 
 // ConfigureNTLM configures the http.Server with the ConnContext required for NTLM.

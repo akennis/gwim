@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"flag"
 	"html/template"
@@ -197,6 +198,7 @@ func main() {
 	// CLI flags for configuration
 	serverAddr := flag.String("server-addr", "localhost:8443", "The address[:port] the server will listen on")
 	certSubject := flag.String("cert-subject", "localhost", "The subject of the certificate to use")
+	certFromCurrentUser := flag.Bool("cert-from-current-user", false, "Whether to pull the certificate from the CurrentUser store instead of LocalMachine")
 	ldapAddress := flag.String("ldap-address", "", "The address of the LDAP server")
 	ldapUsersDN := flag.String("ldap-users-dn", "", "The DN for users in the LDAP server")
 	ldapServiceAccountSPN := flag.String("ldap-service-account-spn", "", "The SPN for the service account in the LDAP server")
@@ -241,18 +243,24 @@ func main() {
 	handler = sessionMiddleware(handler)
 	log.Println("AUTHN/Z: --> Applied session middleware (runs first)")
 
+	// gwim provides a helper to retrieve a certificate from the Windows store for TLS
+	certificate, err := gwim.GetCertificate(*certSubject, *certFromCurrentUser)
+	if err != nil {
+		log.Fatalf("Failed to retrieve certificate: %v", err)
+	}
+
 	// Configure HTTPS server
 	srv := &http.Server{
 		Addr:    *serverAddr,
 		Handler: handler,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{certificate},
+			MinVersion:   tls.VersionTLS13,
+		},
 	}
 
 	if useNTLM {
 		gwim.ConfigureNTLM(srv)
-	}
-
-	if err := gwim.ConfigureTLS(srv, *certSubject); err != nil {
-		log.Fatalf("Failed to configure TLS: %v", err)
 	}
 
 	log.Printf("Starting secure server on https://%s", srv.Addr)

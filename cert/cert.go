@@ -7,12 +7,13 @@ import (
 	"github.com/google/certtostore"
 )
 
-// GetWin32Cert retrieves a certificate from the Windows Local Machine store by subject string
+// GetWin32Cert retrieves a certificate from the Windows certificate store by subject string
 // and returns a tls.Certificate using github.com/google/certtostore for lookup and signing.
-func GetWin32Cert(subject string) (tls.Certificate, error) {
+// The fromCurrentUser parameter determines whether to search the CurrentUser or LocalMachine store.
+func GetWin32Cert(subject string, fromCurrentUser bool) (tls.Certificate, error) {
 	// 1. Initialize certtostore WinCertStore to manage the certificate store access
 	wcs, err := certtostore.OpenWinCertStoreWithOptions(certtostore.WinCertStoreOptions{
-		CurrentUser: false, // LocalMachine
+		CurrentUser: fromCurrentUser,
 		StoreFlags:  certtostore.CertStoreReadOnly,
 	})
 	if err != nil {
@@ -24,7 +25,11 @@ func GetWin32Cert(subject string) (tls.Certificate, error) {
 	// 2. Find Certificate and context by Common Name (Subject) using native library method
 	cert, ctx, _, err := wcs.CertByCommonName(subject)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("certificate with subject %q not found in LocalMachine: %v", subject, err)
+		storeName := "LocalMachine"
+		if fromCurrentUser {
+			storeName = "CurrentUser"
+		}
+		return tls.Certificate{}, fmt.Errorf("certificate with subject %q not found in %s: %v", subject, storeName, err)
 	}
 	// NOTE: We DO NOT defer FreeCertContext(ctx) here.
 	// The context must remain alive so that the private key handle stays valid.

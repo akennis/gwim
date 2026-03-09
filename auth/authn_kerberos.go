@@ -46,7 +46,7 @@ func kerberosAuthn(serverCreds *sspi.Credentials, kp kerberosProvider, opts Auth
 			authHeader := r.Header.Get(AUTHORIZATION)
 			if !strings.HasPrefix(authHeader, NEGOTIATE_SPC) {
 				w.Header().Set(WWW_AUTH, NEGOTIATE)
-				opts.GetOnUnauthorized()(w, r, fmt.Errorf("missing or invalid authentication header"))
+				opts.GetOnUnauthorized()(w, r, fmt.Errorf("requesting client to negotiate kerberos authentication"))
 				return
 			}
 
