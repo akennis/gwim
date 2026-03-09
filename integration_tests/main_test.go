@@ -18,13 +18,21 @@ func TestMain(m *testing.M) {
 }
 
 func TestAuthn(t *testing.T) {
+	// Common tests
+	t.Run("InitialUnauthorized", testAuth_InitialUnauthorized)
+	t.Run("InvalidScheme", testAuth_InvalidScheme)
+
 	switch *authMode {
 	case "ntlm":
-		t.Run("Success", TestNTLM_Success)
-		t.Run("HalfOpen", TestNTLM_HalfOpen)
-		t.Run("Malformed", TestNTLM_Malformed)
+		t.Run("Success", testNTLM_Success)
+		t.Run("FullSequence", testNTLM_FullSequence)
+		t.Run("HalfOpen", testNTLM_HalfOpen)
+		t.Run("Malformed", testNTLM_Malformed)
 	case "kerberos":
-		t.Run("Success", TestKerberos_Success)
+		t.Run("Success", testKerberos_Success)
+		t.Run("FullSequence", testKerberos_FullSequence)
+		t.Run("NegotiateMalformed", testNegotiate_Malformed)
+		t.Run("KerberosMalformed", testKerberos_Malformed)
 	default:
 		t.Fatalf("Unknown auth-mode: %s", *authMode)
 	}
