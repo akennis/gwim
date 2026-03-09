@@ -13,6 +13,7 @@ import (
 
 var (
 	serverURL = flag.String("server-url", "", "The URL of the example server to test against")
+	authMode  = flag.String("auth-mode", "ntlm", "Authentication mode to test (ntlm or kerberos)")
 )
 
 func TestNTLM_Success(t *testing.T) {
