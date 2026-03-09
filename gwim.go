@@ -14,6 +14,11 @@ import (
 	"github.com/alexbrainman/sspi"
 )
 
+// Exported keys for context access
+const (
+	ContextKeyConnID = auth.ContextKeyConnID
+)
+
 // User returns the username from the request context.
 // The second return value is true if the user was found in the context.
 func User(r *http.Request) (string, bool) {
