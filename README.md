@@ -1,129 +1,80 @@
 # gwim
 
-`gwim` is a Go library that simplifies Windows Integrated Authentication (Kerberos and NTLM) for Go web servers.
+`gwim` / Go Windows Integrated Middleware is a Go library that simplifies HTTP server security through native Windows integration, including:
+* authentication middleware via Windows SSPI: Kerberos or NTLM
+* authorization middleware based on LDAP group lookup
+* TLS certificate retrieval from the Windows certificate store
+
+Using this library you can deploy a server application in an Active Directory environment that is secure *and also self-contained* (i.e. a single exe as opposed to a complex IIS / NGINX / Apache deployment).
+
+The authentication middleware handles all phases of user authentication through the HTTP request including the multi-step negotiation and token passing process.  Simply add this middleware to your request handler chain in order to authenticate the requesting user.  Once authenticated the username is added into the request context available for use elsewhere in your server application.
+
+The authorization middleware searches for the authenticated user (via their username within a specified LDAP OU) and finds all LDAP groups (transitively / deeply) that they are a member of.  This set of groups is added into the request context available for use elsewhere in your server application (e.g. limiting route access to group members).
+
+Note: Although authentication supports both Kerberos and NTLM, Kerberos should be used in production as it is significantly more secure.  NTLM support is included only to facilitate local server application development where the developer is hitting the server from a browser on the same host (a scenario where only NTLM works).
+
+## License
+
+This project is licensed under the BSD 3-Clause License - see the [LICENSE](LICENSE) file for details.
+
+## Installation
+
+This package is only supported on Windows.
+
+```bash
+go get github.com/akennis/gwim
+```
 
 ## API
 
 The `gwim` package provides the following functions:
 
-- `NewSSPIHandler(next http.Handler, useNTLM bool) (http.Handler, error)`: Creates an authentication middleware that wraps an existing `http.Handler`.
-- `ConfigureNTLM(server *http.Server)`: Configures an `http.Server` for NTLM authentication.
-- `ConfigureTLS(server *http.Server, certSubject string) error`: Configures an `http.Server` with a TLS certificate from the Windows certificate store.
-- `User(r *http.Request) (string, []string, bool)`: Extracts the authenticated user's username and group memberships from the request context.
+### Authentication
 
-## Usage
+- `NewSSPIHandler(next http.Handler, useNTLM bool, options ...auth.AuthOptions) (http.Handler, error)` — Creates an authentication middleware that wraps an existing `http.Handler`. The `useNTLM` boolean selects NTLM or Kerberos. Optional `auth.AuthOptions` allow customizing error handlers.
+- `ConfigureNTLM(server *http.Server)` — Configures the `http.Server` with the `ConnContext` callback required for NTLM connection tracking.
 
-Here is an example of how to use `gwim` to create a secure web server:
+### LDAP Group Authorization
 
-```go
-package main
+- `NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, options ...auth.AuthOptions) http.Handler` — Returns a middleware that enriches the request context with the authenticated user's LDAP group memberships.
 
-import (
-	"flag"
-	"fmt"
-	"log"
-	"net/http"
+### Request Context Helpers
 
-	"github.com/akennis/gwim"
-	"github.com/akennis/gwim/auth"
-)
+- `User(r *http.Request) (string, bool)` — Returns the authenticated username from the request context.
+- `SetUser(r *http.Request, username string) *http.Request` — Injects a username into the request context, allowing an application to manage sessions itself and bypass per-request authentication.
+- `UserGroups(r *http.Request) ([]string, bool)` — Returns the user's group memberships from the request context.
+- `SetUserGroups(r *http.Request, groups []string) *http.Request` — Injects group memberships into the request context, allowing an application to cache groups itself and bypass the LDAP provider.
 
-func main() {
-	// CLI flags for configuration
-	serverAddr := flag.String("server-addr", "", "The address the server will listen on")
-	secureServerPort := flag.Int("secure-server-port", 0, "The port the secure server will listen on")
-	certSubject := flag.String("cert-subject", "", "The subject of the certificate to use")
-	ldapAddress := flag.String("ldap-address", "", "The address of the LDAP server")
-	ldapUsersDN := flag.String("ldap-users-dn", "", "The DN for users in the LDAP server")
-	ldapServiceAccountSPN := flag.String("ldap-service-account-spn", "", "The SPN for the service account in the LDAP server")
-	flag.Parse()
+### TLS Certificate
 
-	if *serverAddr == "" || *secureServerPort == 0 || *certSubject == "" || *ldapAddress == "" || *ldapUsersDN == "" || *ldapServiceAccountSPN == "" {
-		flag.Usage()
-		log.Fatal("All flags are required")
-	}
+- `GetCertificate(certSubject string, fromCurrentUser bool) (tls.Certificate, error)` — Retrieves a TLS certificate from the Windows certificate store. When `fromCurrentUser` is `true`, the `CurrentUser` store is searched; otherwise `LocalMachine` is used.
 
-	useNTLM := *serverAddr == "localhost"
+### Error Handling (`auth.AuthOptions`)
 
-	// Initialize router
-	router := http.NewServeMux()
-	router.HandleFunc("/", rootHandler)
+Both `NewSSPIHandler` and `NewLdapGroupProvider` accept a variadic `auth.AuthOptions` struct to customize error responses. Each field is an `AuthErrorHandler func(w http.ResponseWriter, r *http.Request, err error)`:
 
-	// --- Apply Middleware ---
-	var handler http.Handler = router
-	var err error
-	if *ldapAddress != "" {
-		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN)
-	}
-	handler, err = gwim.NewSSPIHandler(handler, useNTLM)
-	if err != nil {
-		log.Fatalf("Failed to create SSPI handler: %v", err)
-	}
+| Field | Triggered when… |
+|---|---|
+| `OnUnauthorized` | The `Authorization` header is missing or invalid |
+| `OnInvalidToken` | The base64 token from the client is malformed |
+| `OnAuthFailed` | An error occurs during the SSPI/GSSAPI token exchange |
+| `OnIdentityError` | The username cannot be retrieved after successful auth |
+| `OnLdapConnectionError` | A connection to the LDAP server cannot be established |
+| `OnLdapLookupError` | An error occurs during an LDAP search or lookup |
+| `OnGeneralError` | Catch-all: fills in for any of the above handlers that is not explicitly set |
 
+If no options are provided, sensible defaults are used (plain-text HTTP error responses).
 
-	// Configure HTTPS server
-	srv := &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", *serverAddr, *secureServerPort),
-		Handler: handler,
-	}
+## Usage Examples
 
-	if useNTLM {
-		gwim.ConfigureNTLM(srv)
-	}
-
-	if err := gwim.ConfigureTLS(srv, *certSubject); err != nil {
-		log.Fatalf("Failed to configure TLS: %v", err)
-	}
-
-	log.Printf("Starting secure server on https://%s", srv.Addr)
-	log.Fatal(srv.ListenAndServeTLS("", ""))
-}
-
-func rootHandler(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	username, ok := gwim.User(r)
-	if !ok {
-		// This should theoretically not be reached if middleware is correct
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-	groups, _ := gwim.UserGroups(r)
-	if len(groups) > 0 {
-		fmt.Fprintf(w, "Hello, %s! Your LDAP groups are: %v", username, groups)
-	} else {
-		fmt.Fprintf(w, "Hello, %s! You have a valid session.", username)
-	}
-}
-```
-
-To run the secure Windows server example, you need to provide the following required flags:
-
-```bash
-go run examples/sec-win-server.go \
-    --server-addr <server_address> \
-    --secure-server-port <port> \
-    --cert-subject <certificate_subject> \
-    --ldap-address <ldap_server_address> \
-    --ldap-users-dn <ldap_users_dn> \
-    --ldap-service-account-spn <ldap_service_account_spn>
-```
-
-### Flags
-
-- `server-addr`: The address the server will listen on.
-- `secure-server-port`: The port the secure server will listen on.
-- `cert-subject`: The subject of the certificate to use.
-- `ldap-address`: The address of the LDAP server.
-- `ldap-users-dn`: The DN for users in the LDAP server.
-- `ldap-service-account-spn`: The SPN for the service account in the LDAP server.
-- `from-current-user`: Whether to retrieve the certificate from the `CurrentUser` store instead of the `LocalMachine` store.
+See the [examples](examples) directory for examples of how to use `gwim`:
+* [Minimal secure server via GWIM](examples/min-win-server.go)
+* [Session-enabled secure server via gwim](examples/sec-win-server.go)
+  * this example demonstrates how authentication and authorization results from the provided middleware can be used in conjunction with sessions and caching to produce an efficient and secure server.
 
 ## Integration Testing
 
-The `integration_tests` package contains tests for both NTLM and Kerberos authentication.
+The `integration_tests` package contains client / sever tests for both NTLM and Kerberos authentication.
 
 ### Running NTLM Tests
 
@@ -177,4 +128,3 @@ Kerberos tests require the test server and the test runner to be on **separate m
     go tool covdata textfmt -i=coverage_data -o coverage.out
     go tool cover '-html=coverage.out'
     ```
-
