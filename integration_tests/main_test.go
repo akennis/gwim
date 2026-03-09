@@ -28,9 +28,12 @@ func TestAuthn(t *testing.T) {
 		t.Run("FullSequence", testNTLM_FullSequence)
 		t.Run("HalfOpen", testNTLM_HalfOpen)
 		t.Run("Malformed", testNTLM_Malformed)
+		t.Run("Type3First", testNTLM_Type3First)
+		t.Run("ClientSendsType2", testNTLM_ClientSendsType2)
 	case "kerberos":
 		t.Run("Success", testKerberos_Success)
 		t.Run("FullSequence", testKerberos_FullSequence)
+		t.Run("HalfOpen", testKerberos_HalfOpen)
 		t.Run("NegotiateMalformed", testNegotiate_Malformed)
 		t.Run("KerberosMalformed", testKerberos_Malformed)
 	default:

@@ -380,3 +380,84 @@ func testAuth_InvalidScheme(t *testing.T) {
 		t.Errorf("Expected 401 Unauthorized for unsupported Basic scheme, got %d", resp.StatusCode)
 	}
 }
+
+func testNTLM_Type3First(t *testing.T) {
+	client := &http.Client{}
+
+	sspiClient, err := NewNTLMClient("", "", "")
+	if err != nil {
+		t.Fatalf("Failed to create NTLM client: %v", err)
+	}
+	defer sspiClient.Release()
+
+	// Fake a type 2 to generate a type 3 out of bounds
+	authHeader, _, err := sspiClient.GetAuthHeader("", []byte("TlRMTVNTUAACAAAAAAAAACgAAAABggAAU3J2Tm9uY2UAAAAAAAAAAA=="))
+	if err == nil && authHeader != "" {
+		req, _ := http.NewRequest("GET", *serverURL, nil)
+		req.Header.Set("Authorization", authHeader)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("Failed to send out of sequence NTLM Type 3 token: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("Expected 401 or 400 for out of sequence token, got %d", resp.StatusCode)
+		}
+	} else {
+		t.Logf("Failed to generate type 3 token out of sequence (expected), err: %v", err)
+	}
+}
+
+func testNTLM_ClientSendsType2(t *testing.T) {
+	client := &http.Client{}
+
+	req, _ := http.NewRequest("GET", *serverURL, nil)
+	// A basic mock of a Type 2 message
+	req.Header.Set("Authorization", "NTLM TlRMTVNTUAACAAAAAAAAACgAAAABggAAU3J2Tm9uY2UAAAAAAAAAAA==")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to send NTLM Type 2 token: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("Expected 401 or 400 for client sending Type 2 message, got %d", resp.StatusCode)
+	}
+}
+
+func testKerberos_HalfOpen(t *testing.T) {
+	sspiClient, err := NewKerberosClient()
+	if err != nil {
+		t.Skipf("Skipping Kerberos test: could not acquire credentials: %v", err)
+	}
+	defer sspiClient.Release()
+
+	client := &http.Client{}
+
+	target := strings.TrimPrefix(*serverURL, "http://")
+	target = strings.TrimPrefix(target, "https://")
+	if idx := strings.Index(target, ":"); idx != -1 {
+		target = target[:idx]
+	}
+	spn := "HTTP/" + target
+
+	authHeader, _, err := sspiClient.GetAuthHeader(spn, nil)
+	if err != nil {
+		t.Skipf("Skipping Kerberos test: could not generate token: %v", err)
+	}
+
+	req, _ := http.NewRequest("GET", *serverURL, nil)
+	req.Header.Set("Authorization", authHeader)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make Kerberos request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Multi-step kerberos will return 401 if it's not done yet, single-step returns 200.
+	// If it returns 401, we stop, simulating half-open.
+	if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected 401 or 200 for Kerberos request, got %d", resp.StatusCode)
+	}
+}
