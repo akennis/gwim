@@ -119,3 +119,62 @@ go run examples/sec-win-server.go \
 - `ldap-address`: The address of the LDAP server.
 - `ldap-users-dn`: The DN for users in the LDAP server.
 - `ldap-service-account-spn`: The SPN for the service account in the LDAP server.
+- `from-current-user`: Whether to retrieve the certificate from the `CurrentUser` store instead of the `LocalMachine` store.
+
+## Integration Testing
+
+The `integration_tests` package contains tests for both NTLM and Kerberos authentication.
+
+### Running NTLM Tests
+
+NTLM tests can be run locally by spawning the test server and the test runner on the same machine.
+
+1.  Build the test server:
+    ```powershell
+    go build -o testserver.exe ./integration_tests/cmd/testserver/main.go
+    ```
+2.  Run the test server:
+    ```powershell
+    .\testserver.exe --addr 127.0.0.1:8080 --use-ntlm=true
+    ```
+3.  Run the tests:
+    ```powershell
+    go test -v ./integration_tests -server-url http://127.0.0.1:8080 -auth-mode ntlm
+    ```
+
+### Running Kerberos Tests
+
+Kerberos tests require the test server and the test runner to be on **separate machines** within the same Active Directory domain. This is because Windows handles local Kerberos authentication (Loopback) differently than remote authentication.
+
+1.  Deploy and run `testserver.exe` on Machine A (the "server").
+2.  Run the tests from Machine B (the "client") pointing to Machine A:
+    ```powershell
+    go test -v ./integration_tests -server-url http://<machine-a-hostname>:8080 -auth-mode kerberos
+    ```
+
+## Code Coverage
+
+`gwim` supports code coverage collection for out-of-process integration tests using Go 1.22's `-cover` instrumentation.
+
+1.  Build an instrumented test server:
+    ```powershell
+    go build -cover -o testserver.exe ./integration_tests/cmd/testserver/main.go
+    ```
+2.  Run the server with `GOCOVERDIR` set to an output directory:
+    ```powershell
+    mkdir coverage_data
+    $env:GOCOVERDIR="coverage_data"
+    .\testserver.exe --addr 127.0.0.1:8080 --use-ntlm=true
+    ```
+3.  Run your integration tests as usual.
+4.  Stop the server (Ctrl+C). The server will gracefully shut down and flush coverage data to the `coverage_data` directory.
+5.  View the coverage percentage:
+    ```powershell
+    go tool covdata percent -i=coverage_data
+    ```
+6.  Generate an HTML report:
+    ```powershell
+    go tool covdata textfmt -i=coverage_data -o coverage.out
+    go tool cover '-html=coverage.out'
+    ```
+

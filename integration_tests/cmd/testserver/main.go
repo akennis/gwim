@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/akennis/gwim"
 )
@@ -48,7 +52,25 @@ func main() {
 	}
 	fmt.Printf("Test server listening on %s (NTLM=%v)\n", ln.Addr().String(), *useNTLM)
 
-	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Server failure: %v", err)
+	// Graceful shutdown
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failure: %v", err)
+		}
+	}()
+
+	<-stop
+	fmt.Println("Shutting down server...")
+
+	// Create a deadline to wait for.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
 	}
+
+	fmt.Println("Server exiting")
 }
