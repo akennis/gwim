@@ -139,3 +139,49 @@ func TestKerberosAuthn(t *testing.T) {
 		})
 	}
 }
+
+func TestKerberosAuthn_CustomHandlers(t *testing.T) {
+	var capturedErr error
+
+	opts := AuthOptions{
+		OnGeneralError: func(w http.ResponseWriter, r *http.Request, err error) {
+			capturedErr = err
+			w.WriteHeader(http.StatusTeapot)
+		},
+	}
+	opts.ApplyGeneralError()
+
+	t.Run("OnGeneralError_Catchall", func(t *testing.T) {
+		handler := kerberosAuthn(nil, nil, opts)
+		req := httptest.NewRequest("GET", "http://example.com/foo", nil)
+		rr := httptest.NewRecorder()
+
+		handler(nil).ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusTeapot {
+			t.Errorf("Expected status %d, got %d", http.StatusTeapot, rr.Code)
+		}
+		if capturedErr == nil {
+			t.Error("Expected error to be captured by custom handler")
+		}
+	})
+
+	t.Run("SpecificHandlerTakesPrecedence", func(t *testing.T) {
+		optsWithSpecific := opts
+		optsWithSpecific.OnInvalidToken = func(w http.ResponseWriter, r *http.Request, err error) {
+			w.WriteHeader(http.StatusConflict)
+		}
+		optsWithSpecific.ApplyGeneralError()
+
+		handler := kerberosAuthn(nil, nil, optsWithSpecific)
+		req := httptest.NewRequest("GET", "http://example.com/foo", nil)
+		req.Header.Set(AUTHORIZATION, "Negotiate invalid-base64-!!!")
+		rr := httptest.NewRecorder()
+
+		handler(nil).ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusConflict {
+			t.Errorf("Expected status %d (specific handler), got %d", http.StatusConflict, rr.Code)
+		}
+	})
+}

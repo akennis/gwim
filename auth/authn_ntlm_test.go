@@ -195,3 +195,43 @@ func TestNtlmAuthn(t *testing.T) {
 		})
 	}
 }
+
+func TestNtlmAuthn_CustomHandlers(t *testing.T) {
+	opts := AuthOptions{
+		OnGeneralError: func(w http.ResponseWriter, r *http.Request, err error) {
+			w.WriteHeader(http.StatusTeapot)
+		},
+	}
+	opts.ApplyGeneralError()
+
+	t.Run("OnGeneralError_Catchall", func(t *testing.T) {
+		authCache := cache.New(1*time.Minute, 2*time.Minute)
+		handler := ntlmAuthn(nil, nil, authCache, opts)
+		req := httptest.NewRequest("GET", "http://example.com/foo", nil)
+		rr := httptest.NewRecorder()
+
+		handler(nil).ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusTeapot {
+			t.Errorf("Expected status %d, got %d", http.StatusTeapot, rr.Code)
+		}
+	})
+}
+
+func TestNtlmAuthn_CacheEviction(t *testing.T) {
+	mockCtx := &mockNtlmServerContext{}
+	authCache := cache.New(1*time.Millisecond, 1*time.Millisecond)
+
+	// Setup eviction callback
+	np := &mockNtlmProvider{contexts: []*mockNtlmServerContext{mockCtx}}
+	ntlmAuthn(nil, np, authCache, DefaultAuthOptions())
+
+	authCache.Set("N123", mockCtx, cache.DefaultExpiration)
+
+	// Wait for eviction
+	time.Sleep(5 * time.Millisecond)
+
+	if !mockCtx.releaseCalled {
+		t.Error("Expected SSPI context to be released upon cache eviction")
+	}
+}

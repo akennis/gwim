@@ -190,13 +190,7 @@ func ntlmAuthn(serverCreds *sspi.Credentials, np ntlmProvider, authCache *cache.
 				authCache.Delete(authID)
 			}
 
-			if strings.Contains(username, "@") {
-				username = strings.Split(username, "@")[0]
-			} else if strings.Contains(username, "\\") {
-				parts := strings.Split(username, "\\")
-				username = parts[len(parts)-1]
-			}
-			username = strings.ToLower(username)
+			username = NormalizeUsername(username)
 
 			usernameContext := context.WithValue(r.Context(), ContextKeyUsername, username)
 			r = r.WithContext(usernameContext)

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strings"
 	"sync/atomic"
 
 	"github.com/akennis/gwim/auth"
@@ -33,7 +32,7 @@ func User(r *http.Request) (string, bool) {
 // This allows an application to manage sessions itself and inject the user's
 // identity into the context, bypassing the need for per-request authentication.
 func SetUser(r *http.Request, username string) *http.Request {
-	username = strings.ToLower(strings.Split(username, "@")[0])
+	username = auth.NormalizeUsername(username)
 	ctx := context.WithValue(r.Context(), auth.ContextKeyUsername, username)
 	return r.WithContext(ctx)
 }

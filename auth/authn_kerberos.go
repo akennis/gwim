@@ -72,8 +72,7 @@ func kerberosAuthn(serverCreds *sspi.Credentials, kp kerberosProvider, opts Auth
 				opts.GetOnIdentityError()(w, r, err)
 				return
 			}
-			username = strings.Split(username, "@")[0]
-			username = strings.ToLower(username)
+			username = NormalizeUsername(username)
 
 			usernameContext := context.WithValue(r.Context(), ContextKeyUsername, username)
 			r = r.WithContext(usernameContext)
