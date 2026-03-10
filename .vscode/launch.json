@@ -16,11 +16,11 @@
                 "-cert-subject",
                 "",
                 "-ldap-address",
-                "DC1.ouboces.local:636",
+                "${input:ldap-server}",
                 "-ldap-users-dn",
-                "OU=OUBOCES Users, OU=OUBOCES, DC=ouboces, DC=local",
+                "${input:root-ou}",
                 "-ldap-service-account-spn",
-                "ldap/DC1.ouboces.local"
+                "${input:ldap-service-account-spn}",
             ]
         },
         {
@@ -35,11 +35,11 @@
                 "-cert-subject",
                 "",
                 "-ldap-address",
-                "DC1.ouboces.local:636",
+                "${input:ldap-server}",
                 "-ldap-users-dn",
-                "OU=OUBOCES Users, OU=OUBOCES, DC=ouboces, DC=local",
+                "${input:root-ou}",
                 "-ldap-service-account-spn",
-                "ldap/DC1.ouboces.local"
+                "${input:ldap-service-account-spn}",
             ]
         },
         {
@@ -54,11 +54,11 @@
                 "-cert-subject",
                 "",
                 "-ldap-address",
-                "DC1.ouboces.local:636",
+                "${input:ldap-server}",
                 "-ldap-users-dn",
-                "OU=OUBOCES Users, OU=OUBOCES, DC=ouboces, DC=local",
+                "${input:root-ou}",
                 "-ldap-service-account-spn",
-                "ldap/DC1.ouboces.local"
+                "${input:ldap-service-account-spn}",
             ]
         },
         {
@@ -73,12 +73,29 @@
                 "-cert-subject",
                 "",
                 "-ldap-address",
-                "DC1.ouboces.local:636",
+                "${input:ldap-server}",
                 "-ldap-users-dn",
-                "OU=OUBOCES Users, OU=OUBOCES, DC=ouboces, DC=local",
+                "${input:root-ou}",
                 "-ldap-service-account-spn",
-                "ldap/DC1.ouboces.local"
+                "${input:ldap-service-account-spn}",
             ]
         },
+    ],
+    "inputs": [
+        {
+            "type": "promptString",
+            "id": "ldap-server",
+            "description": "LDAP server hostname:port or IP:port",
+        },
+        {
+            "type": "promptString",
+            "id": "root-ou",
+            "description": "Root OU of the domain",
+        },
+        {
+            "type": "promptString",
+            "id": "ldap-service-account-spn",
+            "description": "SPN of the LDAP service account",
+        }
     ]
 }
