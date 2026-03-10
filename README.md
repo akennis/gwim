@@ -34,7 +34,7 @@ go get github.com/akennis/gwim
 
 ## Quick Start
 
-The snippet below is the smallest possible secure server using `gwim`. It retrieves a TLS certificate from the Windows certificate store, wraps a handler with Kerberos authentication, and starts listening.
+The snippet below is the smallest possible secure server using `gwim`. It retrieves a TLS certificate from the Windows certificate store, wraps a handler with Kerberos authentication, and starts listening. Note, error handling is omitted for brevity.
 
 ```go
 package main
@@ -55,16 +55,10 @@ func main() {
     })
 
     // Wrap the handler with Kerberos authentication (useNTLM = false)
-    handler, err := gwim.NewSSPIHandler(mux, false)
-    if err != nil {
-        log.Fatal(err)
-    }
+    handler, _ := gwim.NewSSPIHandler(mux, false)
 
     // Retrieve a TLS certificate from the Windows certificate store
-    cert, err := gwim.GetCertificate("myserver.corp.local", false)
-    if err != nil {
-        log.Fatal(err)
-    }
+    cert, _ := gwim.GetCertificate("myserver.corp.local", false)
 
     srv := &http.Server{
         Addr:    ":8443",
@@ -105,26 +99,26 @@ The `gwim` package provides the following functions:
 
 ### Authentication
 
-- `NewSSPIHandler(next http.Handler, useNTLM bool, options ...auth.AuthOptions) (http.Handler, error)` — Creates an authentication middleware that wraps an existing `http.Handler`. The `useNTLM` boolean selects NTLM or Kerberos. Optional `auth.AuthOptions` allow customizing error handlers. Returns an error if Windows SSPI credentials cannot be acquired (e.g. the `Negotiate` security package is unavailable).
+- `NewSSPIHandler(next http.Handler, useNTLM bool, options ...auth.AuthOptions) (http.Handler, error)` — Creates a Windows native authentication middleware that wraps an existing `http.Handler`. The `useNTLM` boolean selects NTLM or Kerberos. Optional `auth.AuthOptions` allow customizing error handlers. Returns an error if Windows SSPI credentials cannot be acquired (e.g. the `Negotiate` security package is unavailable). After the handler successfully authenticates a user, the username is added into the request context available for use elsewhere in your server application. If the user cannot be authenticated then the provided error handler is invoked (or the default error handler responds to the HTTP request with a 401 Unauthorized response).
 
 - `ConfigureNTLM(server *http.Server)` — Configures the `http.Server` with the `ConnContext` callback required for NTLM connection tracking. NTLM is connection-oriented — each TCP connection carries its own authentication state. This function assigns a unique ID to every connection so the NTLM handler can track multi-step token exchanges across requests on the same connection. **This call is not needed for Kerberos.**
 
 ### LDAP Group Authorization
 
-- `NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, options ...auth.AuthOptions) http.Handler` — Returns a middleware that enriches the request context with the authenticated user's LDAP group memberships.
+- `NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, options ...auth.AuthOptions) http.Handler` — Returns a middleware that enriches the request context with the authenticated user's LDAP group memberships (transatively).
 
   | Parameter | Example | Description |
   |---|---|---|
   | `ldapAddress` | `ldap://dc01.corp.local` | Address of the LDAP / domain controller |
   | `ldapUsersDN` | `OU=Users,DC=corp,DC=local` | Distinguished Name of the OU containing user accounts |
-  | `ldapServiceAccountSPN` | `HTTP/myserver.corp.local` | SPN used for Kerberos authentication to the LDAP server |
+  | `ldapServiceAccountSPN` | `HTTP/myserver.corp.local` | SPN of the LDAP server |
 
 ### Request Context Helpers
 
 - `User(r *http.Request) (string, bool)` — Returns the authenticated username from the request context.
-- `SetUser(r *http.Request, username string) *http.Request` — Injects a username into the request context, allowing an application to manage sessions itself and bypass per-request authentication.
+- `SetUser(r *http.Request, username string) *http.Request` — Injects a username into the request context, allowing an application to manage sessions itself and bypass per-request authentication (if the user is set in the request context when the SSPI authentication handler runs then it exits early and does not perform authentication - useful for session restoration).
 - `UserGroups(r *http.Request) ([]string, bool)` — Returns the user's group memberships from the request context.
-- `SetUserGroups(r *http.Request, groups []string) *http.Request` — Injects group memberships into the request context, allowing an application to cache groups itself and bypass the LDAP provider.
+- `SetUserGroups(r *http.Request, groups []string) *http.Request` — Injects group memberships into the request context, allowing an application to cache groups itself and bypass the LDAP provider (if the groups are set in the request context when the LDAP provider runs then it exits early and does not perform an LDAP lookup).
 
 Use `SetUser` and `SetUserGroups` to restore a previously authenticated identity from a session store, avoiding re-authentication and LDAP lookups on every request:
 ```go
@@ -138,11 +132,7 @@ See [sec-win-server.go](examples/sec-win-server.go) for a full working example o
 
 ### TLS Certificate
 
-- `GetCertificate(certSubject string, fromCurrentUser bool) (tls.Certificate, error)` — Retrieves a TLS certificate from the Windows certificate store. When `fromCurrentUser` is `true`, the `CurrentUser` store is searched; otherwise `LocalMachine` is used.
-
-### Exported Constants
-
-- `ContextKeyConnID` — The context key used internally by `ConfigureNTLM` to track connection IDs. Exported so that advanced users can access the raw connection ID if needed.
+- `GetCertificate(certSubject string, fromCurrentUser bool) (tls.Certificate, error)` — Retrieves a TLS certificate from the Windows certificate store. When `fromCurrentUser` is `true`, the `CurrentUser` store is searched; otherwise `LocalMachine` is used. This certificate should be applied to the `http.Server.TLSConfig.Certificates` field supporting TLS.
 
 ### Error Handling (`auth.AuthOptions`)
 
