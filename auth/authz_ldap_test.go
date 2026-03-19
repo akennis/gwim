@@ -54,7 +54,10 @@ func (m *mockLdapClient) GSSAPIBind(client ldap.GSSAPIClient, target, password s
 
 func TestCreateChannelBindings(t *testing.T) {
 	certRaw := []byte("test certificate raw bytes")
-	bindings := createChannelBindings(certRaw)
+	bindings, err := createChannelBindings(certRaw)
+	if err != nil {
+		t.Fatalf("createChannelBindings() unexpected error: %v", err)
+	}
 
 	if len(bindings) == 0 {
 		t.Fatal("Expected non-empty channel bindings")
@@ -138,6 +141,51 @@ func TestGetUserGroups(t *testing.T) {
 			expected: nil,
 			wantErr:  true,
 		},
+		{
+			name:     "BatchedSearch",
+			username: "testuser",
+			searchSetup: func(m *mockLdapClient) {
+				// 101 SIDs forces two batches: [0..99] and [100].
+				sids := make([][]byte, 101)
+				for i := range sids {
+					sids[i] = []byte{byte(i)}
+				}
+				batchCall := 0
+				m.SearchFunc = func(req *ldap.SearchRequest) (*ldap.SearchResult, error) {
+					if req.BaseDN == "OU=Users,DC=example,DC=com" {
+						return &ldap.SearchResult{
+							Entries: []*ldap.Entry{
+								{DN: "CN=testuser,OU=Users,DC=example,DC=com"},
+							},
+						}, nil
+					}
+					if req.BaseDN == "CN=testuser,OU=Users,DC=example,DC=com" {
+						return &ldap.SearchResult{
+							Entries: []*ldap.Entry{
+								{
+									DN: "CN=testuser,OU=Users,DC=example,DC=com",
+									Attributes: []*ldap.EntryAttribute{
+										{Name: "tokenGroups", ByteValues: sids},
+									},
+								},
+							},
+						}, nil
+					}
+					// Each group batch search returns one group entry.
+					batchCall++
+					return &ldap.SearchResult{
+						Entries: []*ldap.Entry{
+							{DN: fmt.Sprintf("CN=Group%d,OU=Groups,DC=example,DC=com", batchCall)},
+						},
+					}, nil
+				}
+			},
+			expected: []string{
+				"CN=Group1,OU=Groups,DC=example,DC=com",
+				"CN=Group2,OU=Groups,DC=example,DC=com",
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -196,7 +244,7 @@ func TestLdapGroupProvider(t *testing.T) {
 			}
 		})
 
-		handler := LdapGroupProvider(serverInfo, DefaultAuthOptions())(nextHandler)
+		handler := LdapGroupProvider(serverInfo, DefaultAuthErrorHandlers())(nextHandler)
 
 		req := httptest.NewRequest("GET", "/", nil)
 		ctx := context.WithValue(req.Context(), ContextKeyUsername, "testuser")

@@ -78,7 +78,11 @@ func connect(l LdapServerInfo) (ldapClient, error) {
 	var cbt []byte
 	state, ok := conn.TLSConnectionState()
 	if ok && len(state.PeerCertificates) > 0 {
-		cbt = createChannelBindings(state.PeerCertificates[0].Raw)
+		cbt, err = createChannelBindings(state.PeerCertificates[0].Raw)
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to create channel bindings: %w", err)
+		}
 	}
 
 	client := &sspiGssapiClient{cred: cred, channelBindings: cbt}
@@ -90,7 +94,7 @@ func connect(l LdapServerInfo) (ldapClient, error) {
 	return &ldapWrapper{conn}, nil
 }
 
-func createChannelBindings(certRaw []byte) []byte {
+func createChannelBindings(certRaw []byte) ([]byte, error) {
 	h := sha256.Sum256(certRaw)
 	appData := append([]byte("tls-server-end-point:"), h[:]...)
 
@@ -100,9 +104,11 @@ func createChannelBindings(certRaw []byte) []byte {
 	}
 
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.LittleEndian, hdr)
+	if err := binary.Write(&buf, binary.LittleEndian, hdr); err != nil {
+		return nil, fmt.Errorf("failed to write GSS channel bindings header: %w", err)
+	}
 	buf.Write(appData)
-	return buf.Bytes()
+	return buf.Bytes(), nil
 }
 
 func getUserGroups(ldapServiceConn ldapClient, ldapUsersDN string, username string) ([]string, error) {
@@ -171,41 +177,48 @@ func getUserGroups(ldapServiceConn ldapClient, ldapUsersDN string, username stri
 		rootDN = ldapUsersDN
 	}
 
-	// Now we have the SIDs, we build a filter to find all matching groups.
-	var filterBuilder strings.Builder
-	filterBuilder.WriteString("(|")
-	for _, sidBytes := range groupSidsBytes {
-		// The SID needs to be escaped for the filter.
-		filterBuilder.WriteString("(objectSid=")
-		for _, b := range sidBytes {
-			filterBuilder.WriteString(fmt.Sprintf("\\%02x", b))
+	// Search for groups in batches to avoid exceeding the LDAP server's
+	// maximum filter size, which can be hit by users with many group memberships.
+	const sidBatchSize = 100
+	var groups []string
+	for i := 0; i < len(groupSidsBytes); i += sidBatchSize {
+		end := i + sidBatchSize
+		if end > len(groupSidsBytes) {
+			end = len(groupSidsBytes)
+		}
+
+		var filterBuilder strings.Builder
+		filterBuilder.WriteString("(|")
+		for _, sidBytes := range groupSidsBytes[i:end] {
+			// The SID needs to be escaped for the filter.
+			filterBuilder.WriteString("(objectSid=")
+			for _, b := range sidBytes {
+				filterBuilder.WriteString(fmt.Sprintf("\\%02x", b))
+			}
+			filterBuilder.WriteString(")")
 		}
 		filterBuilder.WriteString(")")
-	}
-	filterBuilder.WriteString(")")
 
-	groupSearchRequest := ldap.NewSearchRequest(
-		rootDN, // Search from the derived root DN to find all groups.
-		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
-		filterBuilder.String(),
-		// We want the distinguished names (DNs) of the groups.
-		[]string{"dn"},
-		nil,
-	)
-	groupSearchResult, err := ldapServiceConn.Search(groupSearchRequest)
-	if err != nil {
-		return nil, fmt.Errorf("group search by SID failed for user %q: %w", username, err)
+		groupSearchRequest := ldap.NewSearchRequest(
+			rootDN, // Search from the derived root DN to find all groups.
+			ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
+			filterBuilder.String(),
+			// We want the distinguished names (DNs) of the groups.
+			[]string{"dn"},
+			nil,
+		)
+		groupSearchResult, err := ldapServiceConn.Search(groupSearchRequest)
+		if err != nil {
+			return nil, fmt.Errorf("group search by SID failed for user %q: %w", username, err)
+		}
+		for _, entry := range groupSearchResult.Entries {
+			groups = append(groups, entry.DN)
+		}
 	}
 
-	if len(groupSearchResult.Entries) == 0 {
+	if len(groups) == 0 {
 		return []string{}, nil
 	}
-
-	groups := make([]string, len(groupSearchResult.Entries))
-	for i, entry := range groupSearchResult.Entries {
-		groups[i] = entry.DN
-	}
-
 	return groups, nil
 }
 
@@ -215,11 +228,11 @@ type ldapConnector func(l LdapServerInfo) (ldapClient, error)
 // currentLdapConnector is the function used to connect to LDAP, can be overridden for testing.
 var currentLdapConnector ldapConnector = connect
 
-func LdapGroupProvider(ldapServerInfo LdapServerInfo, options ...AuthOptions) func(http.Handler) http.Handler {
+func LdapGroupProvider(ldapServerInfo LdapServerInfo, errHndlrs ...AuthErrorHandlers) func(http.Handler) http.Handler {
 	ldapPool := make(chan ldapClient, 10)
-	var opts AuthOptions
-	if len(options) > 0 {
-		opts = options[0]
+	var opts AuthErrorHandlers
+	if len(errHndlrs) > 0 {
+		opts = errHndlrs[0]
 	}
 	opts.ApplyGeneralError()
 
