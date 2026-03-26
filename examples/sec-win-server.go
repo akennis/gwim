@@ -243,9 +243,10 @@ func main() {
 	// GetCertificateFunc fetches the cert from the Windows store immediately so
 	// that any configuration error (wrong subject, expired cert, etc.) is caught
 	// here at startup rather than on the first TLS handshake. The returned
-	// callback caches the cert and automatically refreshes it within 7 days of expiry.
+	// callback caches the cert and automatically refreshes it in the background
+	// within the refresh window before expiry.
 	// The closer releases Windows store handles after all connections have drained.
-	getCertificate, certCloser, err := gwim.GetCertificateFunc(*certSubject, certStore)
+	getCertificate, certCloser, err := gwim.GetCertificateFunc(*certSubject, certStore, gwim.DefaultRefreshThreshold)
 	if err != nil {
 		log.Fatalf("Failed to load TLS certificate %q: %v", *certSubject, err)
 	}

@@ -11,7 +11,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,10 +26,6 @@ const (
 	// StoreCurrentUser searches the CurrentUser certificate store.
 	StoreCurrentUser
 )
-
-// refreshThreshold is the duration before a certificate's expiry at which
-// GetCertificateFunc will transparently fetch a fresh certificate from the store.
-const refreshThreshold = 7 * 24 * time.Hour
 
 // CertificateSource holds a TLS certificate retrieved from the Windows store along
 // with the underlying store handles required to keep the private key signer valid.
@@ -147,17 +142,21 @@ func (c *certCloser) Close() error {
 // certificate and transparently refreshes it when the certificate is within
 // refreshThreshold of expiry, enabling zero-downtime certificate rotation.
 //
+// refreshThreshold controls how far before expiry a background refresh is
+// triggered. The refresh runs in a separate goroutine so that in-flight
+// requests are never blocked waiting for the store: the cached certificate
+// (stale but still valid) is served until the background fetch completes.
+// Only one refresh goroutine runs at a time; subsequent requests within the
+// same window are served from the cache immediately.
+//
 // The returned io.Closer releases the Windows store handles held by the
 // currently-cached certificate. It should be called after the server has
 // finished draining connections (e.g. after http.Server.Shutdown returns).
 //
-// The callback is safe for concurrent use. The hot path (cache hit) is
-// lock-free: it performs a single atomic pointer load and a time comparison.
-// The mutex is only acquired on the slow path when a refresh is needed, and
-// double-checked locking prevents multiple goroutines from refreshing
-// simultaneously. When a refresh fails, the cached (possibly stale) certificate
-// is returned so that the server continues serving rather than failing abruptly.
-func GetCertificateFunc(subject string, store CertStore) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
+// The callback is safe for concurrent use. Both the hot path (cache hit) and
+// the refresh-pending path perform only atomic pointer loads — no mutex is
+// ever held on the request path.
+func GetCertificateFunc(subject string, store CertStore, refreshThreshold time.Duration) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
 	// Eagerly fetch the certificate now so that configuration errors (wrong
 	// subject, missing cert, validation failure) are surfaced at startup rather
 	// than on the first TLS handshake.
@@ -165,51 +164,62 @@ func GetCertificateFunc(subject string, store CertStore) (func(*tls.ClientHelloI
 	if err != nil {
 		return nil, nil, err
 	}
-	leaf, _ := x509.ParseCertificate(initial.Certificate.Certificate[0])
+	leaf, err := x509.ParseCertificate(initial.Certificate.Certificate[0])
+	if err != nil {
+		initial.Close()
+		return nil, nil, fmt.Errorf("cert: failed to parse leaf for %q: %w", subject, err)
+	}
 
 	var (
-		mu     sync.Mutex
-		cached atomic.Pointer[cachedCert]
+		cached     atomic.Pointer[cachedCert]
+		refreshing atomic.Bool
 	)
 	cached.Store(&cachedCert{source: initial, expiry: leaf.NotAfter})
 
 	getCert := func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		// Hot path: a single atomic pointer load — no lock required.
-		if c := cached.Load(); c != nil && time.Until(c.expiry) >= refreshThreshold {
+		c := cached.Load()
+
+		// Hot path: cert is fresh — return immediately without any synchronisation.
+		if c != nil && time.Until(c.expiry) >= refreshThreshold {
 			return &c.source.Certificate, nil
 		}
 
-		// Slow path: serialize refreshes to avoid a thundering herd.
-		mu.Lock()
-		defer mu.Unlock()
+		// Within the refresh window: fire a background refresh if one is not
+		// already running, then return the current cert without blocking.
+		if refreshing.CompareAndSwap(false, true) {
+			go func() {
+				defer refreshing.Store(false)
 
-		// Re-check after acquiring the lock; another goroutine may have already
-		// completed a refresh while this one was waiting.
-		if c := cached.Load(); c != nil && time.Until(c.expiry) >= refreshThreshold {
+				fresh, err := GetWin32Cert(subject, store)
+				if err != nil {
+					// Keep serving the cached cert; the next request will retry.
+					return
+				}
+
+				// Parse the leaf once to cache its expiry. The cert bytes are
+				// guaranteed valid — GetWin32Cert already called x509.Verify.
+				freshLeaf, err := x509.ParseCertificate(fresh.Certificate.Certificate[0])
+				if err != nil {
+					// Keep serving the cached cert; the next request will retry.
+					fresh.Close()
+					return
+				}
+
+				// Atomically publish the new cert and expiry as a single unit so
+				// that readers on the hot path never observe a mismatched pair.
+				// The previous source is not explicitly closed here because ongoing
+				// TLS sessions may still hold a reference to its private key signer;
+				// the Windows store handles will be released by the GC once the old
+				// signer is no longer reachable.
+				cached.Store(&cachedCert{source: fresh, expiry: freshLeaf.NotAfter})
+			}()
+		}
+
+		// Serve the current cert (may be near expiry) while the refresh runs.
+		if c != nil {
 			return &c.source.Certificate, nil
 		}
-
-		fresh, err := GetWin32Cert(subject, store)
-		if err != nil {
-			if c := cached.Load(); c != nil {
-				// Best-effort: return the stale cert rather than failing.
-				return &c.source.Certificate, nil
-			}
-			return nil, err
-		}
-
-		// Parse the leaf once to cache its expiry. The cert bytes are guaranteed
-		// valid here — GetWin32Cert already called x509.Verify on them.
-		leaf, _ := x509.ParseCertificate(fresh.Certificate.Certificate[0])
-
-		// Atomically publish the new cert and its expiry as a single unit, so
-		// readers on the hot path can never observe a mismatched pair.
-		// The previous source is not explicitly closed here because ongoing TLS
-		// sessions may still be using its private key signer. The Windows store
-		// handles it held will be released once the Go runtime garbage-collects
-		// the old signer.
-		cached.Store(&cachedCert{source: fresh, expiry: leaf.NotAfter})
-		return &fresh.Certificate, nil
+		return nil, fmt.Errorf("cert: no certificate available for %q", subject)
 	}
 
 	return getCert, &certCloser{cached: &cached}, nil

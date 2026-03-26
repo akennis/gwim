@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"sync/atomic"
+	"time"
 
 	iauth "github.com/akennis/gwim/internal/auth"
 	icert "github.com/akennis/gwim/internal/cert"
@@ -119,19 +120,25 @@ const (
 	CertStoreLocalMachine CertStore = icert.StoreLocalMachine
 	// CertStoreCurrentUser searches the CurrentUser certificate store.
 	CertStoreCurrentUser CertStore = icert.StoreCurrentUser
+
+	// DefaultRefreshThreshold is the window before certificate expiry at which
+	// GetCertificateFunc triggers a background refresh. Pass this value to
+	// GetCertificateFunc when you do not need a custom refresh window.
+	DefaultRefreshThreshold = 7 * 24 * time.Hour
 )
 
 // GetCertificateFunc fetches the named certificate from the Windows store
 // immediately — surfacing any configuration error at startup rather than on
 // the first TLS handshake — and returns a tls.Config.GetCertificate callback
-// that transparently refreshes the certificate when it is within 7 days of
-// expiry, enabling zero-downtime rotation.
+// that transparently refreshes the certificate in a background goroutine when
+// it is within refreshThreshold of expiry, enabling zero-downtime rotation.
+// Pass DefaultRefreshThreshold for the standard 7-day window.
 //
 // The returned io.Closer releases the Windows store handles for the
 // currently-cached certificate. Call it after http.Server.Shutdown returns
 // to ensure all active connections have already finished.
-func GetCertificateFunc(certSubject string, store CertStore) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
-	return icert.GetCertificateFunc(certSubject, store)
+func GetCertificateFunc(certSubject string, store CertStore, refreshThreshold time.Duration) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
+	return icert.GetCertificateFunc(certSubject, store, refreshThreshold)
 }
 
 // --- Server configuration ---
@@ -139,7 +146,7 @@ func GetCertificateFunc(certSubject string, store CertStore) (func(*tls.ClientHe
 // ConfigureNTLM sets the ConnContext on server so that each connection is
 // assigned a unique ID. This ID is required by the NTLM handler to correlate
 // the two-round token exchange across separate HTTP requests on the same
-// keep-alive connection.
+// keep-alive connection. Only required when using NTLM authentication.
 func ConfigureNTLM(server *http.Server) {
 	connID := uint64(0)
 	server.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
