@@ -13,75 +13,63 @@ import (
 	"html/template"
 	"log"
 	"net/http"
-	"sync"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/akennis/gwim"
 	"github.com/akennis/gwim/auth"
+	"github.com/patrickmn/go-cache"
 )
 
 // --- Session Management ---
 
+// ctxKey is an unexported type for context keys set by this file, preventing
+// collisions with keys from other packages.
+type ctxKey string
+
+const sessionAuthKey ctxKey = "session-authenticated"
+
 type Session struct {
 	Username     string
-	Expiry       time.Time
 	Groups       []string
 	GroupsExpiry time.Time
 }
 
 var (
-	sessionStore = make(map[string]Session)
-	sessionMutex = &sync.RWMutex{}
-	sessionTTL   = 15 * time.Minute // Sessions are valid for 15 minutes
+	sessionStore    = cache.New(sessionTTL, 2*sessionTTL)
+	sessionTTL      = 15 * time.Minute
 )
 
 const sessionCookieName = "sec-win-server-session"
 
-const sessionAuthKey = "session-authenticated"
-
 // newSession creates a new session for the given username and returns the session ID.
 func newSession(username string) string {
 	sessionID := make([]byte, 32)
-	rand.Read(sessionID)
-	id := hex.EncodeToString(sessionID)
-
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
-	sessionStore[id] = Session{
-		Username: username,
-		Expiry:   time.Now().Add(sessionTTL),
+	if _, err := rand.Read(sessionID); err != nil {
+		log.Fatalf("failed to generate session ID: %v", err)
 	}
+	id := hex.EncodeToString(sessionID)
+	sessionStore.Set(id, Session{Username: username}, cache.DefaultExpiration)
 	log.Printf("Created session %s for user %s", id, username)
 	return id
 }
 
 // getSession returns the session from the session store if the session is valid.
 func getSession(sessionID string) (Session, bool) {
-	sessionMutex.RLock()
-	defer sessionMutex.RUnlock()
-	session, found := sessionStore[sessionID]
-	if !found || time.Now().After(session.Expiry) {
-		if found {
-			// Clean up expired session
-			go func() {
-				sessionMutex.Lock()
-				defer sessionMutex.Unlock()
-				delete(sessionStore, sessionID)
-				log.Printf("Cleaned up expired session %s", sessionID)
-			}()
-		}
+	item, found := sessionStore.Get(sessionID)
+	if !found {
 		return Session{}, false
 	}
-	return session, true
+	return item.(Session), true
 }
 
 // regenerateSession clears the old session and creates a new one for the user. It returns the new session ID.
 func regenerateSession(w http.ResponseWriter, r *http.Request, username string) string {
 	// If a cookie exists, delete the old session it points to.
 	if oldCookie, err := r.Cookie(sessionCookieName); err == nil {
-		sessionMutex.Lock()
-		delete(sessionStore, oldCookie.Value)
-		sessionMutex.Unlock()
+		sessionStore.Delete(oldCookie.Value)
 		log.Printf("Regenerating session: Deleted old session %s", oldCookie.Value)
 	}
 
@@ -92,6 +80,7 @@ func regenerateSession(w http.ResponseWriter, r *http.Request, username string) 
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    sessionID,
+		Path:     "/",
 		Expires:  time.Now().Add(sessionTTL),
 		HttpOnly: true,
 		Secure:   true,
@@ -107,14 +96,15 @@ func regenerateSession(w http.ResponseWriter, r *http.Request, username string) 
 
 // updateSessionWithGroups updates the session store with the user's group memberships.
 func updateSessionWithGroups(sessionID string, groups []string) {
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
-	if session, found := sessionStore[sessionID]; found {
-		session.Groups = groups
-		session.GroupsExpiry = time.Now().Add(5 * time.Minute)
-		sessionStore[sessionID] = session
-		log.Printf("Cached groups for user %s in session %s", session.Username, sessionID)
+	item, expiry, found := sessionStore.GetWithExpiration(sessionID)
+	if !found {
+		return
 	}
+	session := item.(Session)
+	session.Groups = groups
+	session.GroupsExpiry = time.Now().Add(5 * time.Minute)
+	sessionStore.Set(sessionID, session, time.Until(expiry))
+	log.Printf("Cached groups for user %s in session %s", session.Username, sessionID)
 }
 
 // --- HTTP Middleware ---
@@ -136,7 +126,7 @@ func sessionMiddleware(next http.Handler) http.Handler {
 		if !ok {
 			// Invalid or expired session, clear cookie and proceed to authentication
 			log.Printf("AUTHN/Z: [%s] Invalid or expired session. Proceeding to SSPI authentication.", r.RemoteAddr)
-			http.SetCookie(w, &http.Cookie{Name: sessionCookieName, MaxAge: -1})
+			http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Path: "/", MaxAge: -1})
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -203,6 +193,7 @@ func main() {
 	serverAddr := flag.String("server-addr", "localhost:8443", "The address[:port] the server will listen on")
 	certSubject := flag.String("cert-subject", "localhost", "The subject of the certificate to use")
 	certFromCurrentUser := flag.Bool("cert-from-current-user", false, "Whether to pull the certificate from the CurrentUser store instead of LocalMachine")
+	useNTLM := flag.Bool("use-ntlm", false, "Use NTLM instead of Kerberos for authentication (required for non-domain or localhost scenarios)")
 	ldapAddress := flag.String("ldap-address", "", "The address of the LDAP server")
 	ldapUsersDN := flag.String("ldap-users-dn", "", "The DN for users in the LDAP server")
 	ldapServiceAccountSPN := flag.String("ldap-service-account-spn", "", "The SPN for the service account in the LDAP server")
@@ -211,8 +202,6 @@ func main() {
 	if *ldapAddress == "" || *ldapUsersDN == "" || *ldapServiceAccountSPN == "" {
 		log.Println("Warning: LDAP flags not set, group provider will be disabled.")
 	}
-
-	useNTLM := *serverAddr == "localhost:8443" || *serverAddr == "localhost"
 
 	// Initialize router
 	router := http.NewServeMux()
@@ -235,7 +224,7 @@ func main() {
 	}
 
 	// SSPI Handler: Performs Kerberos/NTLM auth if no user is in the context.
-	handler, err := gwim.NewSSPIHandler(handler, useNTLM, auth.AuthErrorHandlers{
+	handler, err := gwim.NewSSPIHandler(handler, *useNTLM, auth.AuthErrorHandlers{
 		OnGeneralError: onSecAuthError,
 	})
 	if err != nil {
@@ -252,24 +241,53 @@ func main() {
 		certStore = gwim.CertStoreCurrentUser
 	}
 
+	// GetCertificateFunc fetches the cert from the Windows store immediately so
+	// that any configuration error (wrong subject, expired cert, etc.) is caught
+	// here at startup rather than on the first TLS handshake. The returned
+	// callback caches the cert and automatically refreshes it within 7 days of expiry.
+	// The closer releases Windows store handles after all connections have drained.
+	getCertificate, certCloser, err := gwim.GetCertificateFunc(*certSubject, certStore)
+	if err != nil {
+		log.Fatalf("Failed to load TLS certificate %q: %v", *certSubject, err)
+	}
+
 	// Configure HTTPS server.
-	// GetCertificateFunc fetches the cert from the Windows store and caches it,
-	// automatically refreshing it when it is within 7 days of expiry.
 	srv := &http.Server{
 		Addr:    *serverAddr,
 		Handler: handler,
 		TLSConfig: &tls.Config{
-			GetCertificate: gwim.GetCertificateFunc(*certSubject, certStore),
+			GetCertificate: getCertificate,
 			MinVersion:     tls.VersionTLS13,
 		},
 	}
 
-	if useNTLM {
+	if *useNTLM {
 		gwim.ConfigureNTLM(srv)
 	}
 
+	// Graceful shutdown: wait for SIGINT or SIGTERM, drain connections, then
+	// release the certificate store handles.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-quit
+		log.Println("Shutting down server...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("Server shutdown error: %v", err)
+		}
+	}()
+
 	log.Printf("Starting secure server on https://%s", srv.Addr)
-	log.Fatal(srv.ListenAndServeTLS("", ""))
+	if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
+
+	// All connections have drained; safe to release cert store handles.
+	if err := certCloser.Close(); err != nil {
+		log.Printf("Failed to close certificate store: %v", err)
+	}
 }
 
 func onSecAuthError(w http.ResponseWriter, r *http.Request, err error) {

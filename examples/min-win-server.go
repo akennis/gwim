@@ -20,6 +20,7 @@ func main() {
 	serverAddr := flag.String("server-addr", "localhost:8443", "The address[:port] the server will listen on")
 	certSubject := flag.String("cert-subject", "localhost", "The subject of the certificate to use")
 	certFromCurrentUser := flag.Bool("cert-from-current-user", false, "Whether to pull the certificate from the CurrentUser store instead of LocalMachine")
+	useNTLM := flag.Bool("use-ntlm", false, "Use NTLM instead of Kerberos for authentication (required for non-domain or localhost scenarios)")
 	ldapAddress := flag.String("ldap-address", "", "The address of the LDAP server")
 	ldapUsersDN := flag.String("ldap-users-dn", "", "The DN for users in the LDAP server")
 	ldapServiceAccountSPN := flag.String("ldap-service-account-spn", "", "The SPN for the service account in the LDAP server")
@@ -28,9 +29,6 @@ func main() {
 	if *ldapAddress == "" || *ldapUsersDN == "" || *ldapServiceAccountSPN == "" {
 		log.Println("Warning: LDAP flags not set, group provider will be disabled.")
 	}
-
-	// Determine if NTLM should be enabled (usually for localhost/non-FQDN tests)
-	useNTLM := *serverAddr == "localhost:8443" || *serverAddr == "localhost"
 
 	// Initialize router
 	router := http.NewServeMux()
@@ -50,7 +48,7 @@ func main() {
 
 	// SSPI Handler: Performs Windows Authentication (Kerberos/NTLM).
 	// This is the core of the gwim API.
-	handler, err := gwim.NewSSPIHandler(handler, useNTLM, auth.AuthErrorHandlers{
+	handler, err := gwim.NewSSPIHandler(handler, *useNTLM, auth.AuthErrorHandlers{
 		OnGeneralError: onMinAuthError,
 	})
 	if err != nil {
@@ -63,20 +61,26 @@ func main() {
 		certStore = gwim.CertStoreCurrentUser
 	}
 
-	// Configure HTTPS server.
-	// GetCertificateFunc fetches the cert from the Windows store and caches it,
-	// automatically refreshing it when it is within 7 days of expiry.
+	// GetCertificateFunc fetches the cert from the Windows store immediately so
+	// that any configuration error (wrong subject, expired cert, etc.) is caught
+	// here at startup rather than on the first TLS handshake. The returned
+	// callback caches the cert and automatically refreshes it within 7 days of expiry.
+	getCertificate, _, err := gwim.GetCertificateFunc(*certSubject, certStore)
+	if err != nil {
+		log.Fatalf("Failed to load TLS certificate %q: %v", *certSubject, err)
+	}
+
 	srv := &http.Server{
 		Addr:    *serverAddr,
 		Handler: handler,
 		TLSConfig: &tls.Config{
-			GetCertificate: gwim.GetCertificateFunc(*certSubject, certStore),
+			GetCertificate: getCertificate,
 			MinVersion:     tls.VersionTLS13,
 		},
 	}
 
 	// NTLM requires specific connection handling on Windows.
-	if useNTLM {
+	if *useNTLM {
 		gwim.ConfigureNTLM(srv)
 	}
 

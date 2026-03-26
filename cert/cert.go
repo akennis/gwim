@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -125,13 +126,30 @@ type cachedCert struct {
 	expiry time.Time
 }
 
-// GetCertificateFunc returns a tls.Config.GetCertificate callback that fetches
-// the named certificate from the Windows store, caches it, and transparently
-// refreshes the cache when the certificate is within RefreshThreshold of expiry.
+// certCloser implements io.Closer and releases the currently-cached certificate
+// source. It is intended to be called on server shutdown, after active
+// connections have drained (e.g. after http.Server.Shutdown returns).
+type certCloser struct {
+	cached *atomic.Pointer[cachedCert]
+}
+
+func (c *certCloser) Close() error {
+	if cc := c.cached.Load(); cc != nil {
+		return cc.source.Close()
+	}
+	return nil
+}
+
+// GetCertificateFunc fetches the named certificate from the Windows store
+// immediately at call time, returning an error if that initial fetch fails so
+// that servers can abort startup before accepting any requests. On success it
+// returns a tls.Config.GetCertificate callback that serves the cached
+// certificate and transparently refreshes it when the certificate is within
+// RefreshThreshold of expiry, enabling zero-downtime certificate rotation.
 //
-// Using this function instead of GetWin32Cert once at startup enables
-// zero-downtime certificate rotation: renewing the cert in the Windows store
-// is sufficient — no server restart is required.
+// The returned io.Closer releases the Windows store handles held by the
+// currently-cached certificate. It should be called after the server has
+// finished draining connections (e.g. after http.Server.Shutdown returns).
 //
 // The callback is safe for concurrent use. The hot path (cache hit) is
 // lock-free: it performs a single atomic pointer load and a time comparison.
@@ -139,13 +157,23 @@ type cachedCert struct {
 // double-checked locking prevents multiple goroutines from refreshing
 // simultaneously. When a refresh fails, the cached (possibly stale) certificate
 // is returned so that the server continues serving rather than failing abruptly.
-func GetCertificateFunc(subject string, store CertStore) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+func GetCertificateFunc(subject string, store CertStore) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
+	// Eagerly fetch the certificate now so that configuration errors (wrong
+	// subject, missing cert, validation failure) are surfaced at startup rather
+	// than on the first TLS handshake.
+	initial, err := GetWin32Cert(subject, store)
+	if err != nil {
+		return nil, nil, err
+	}
+	leaf, _ := x509.ParseCertificate(initial.Certificate.Certificate[0])
+
 	var (
 		mu     sync.Mutex
 		cached atomic.Pointer[cachedCert]
 	)
+	cached.Store(&cachedCert{source: initial, expiry: leaf.NotAfter})
 
-	return func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	getCert := func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		// Hot path: a single atomic pointer load — no lock required.
 		if c := cached.Load(); c != nil && time.Until(c.expiry) >= RefreshThreshold {
 			return &c.source.Certificate, nil
@@ -183,4 +211,6 @@ func GetCertificateFunc(subject string, store CertStore) func(*tls.ClientHelloIn
 		cached.Store(&cachedCert{source: fresh, expiry: leaf.NotAfter})
 		return &fresh.Certificate, nil
 	}
+
+	return getCert, &certCloser{cached: &cached}, nil
 }

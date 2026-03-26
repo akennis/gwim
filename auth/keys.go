@@ -4,10 +4,13 @@
 
 package auth
 
-type ContextKey string
+// contextKey is an unexported type for context keys in this package.
+// Using an unexported type prevents external packages from creating colliding
+// keys, even though the constant values themselves are exported.
+type contextKey string
 
 const (
-	ContextKeyUserGroups ContextKey = "userGroups"
-	ContextKeyUsername   ContextKey = "username"
-	ContextKeyConnID     ContextKey = "connId"
+	ContextKeyUserGroups contextKey = "userGroups"
+	ContextKeyUsername   contextKey = "username"
+	ContextKeyConnID     contextKey = "connId"
 )

@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -103,11 +104,17 @@ func GetCertificate(certSubject string, store CertStore) (*cert.CertificateSourc
 	return cert.GetWin32Cert(certSubject, store)
 }
 
-// GetCertificateFunc returns a tls.Config.GetCertificate callback that fetches
-// the named certificate from the Windows store with caching and automatic
-// refresh when the certificate is within 7 days of expiry. Use this instead of
-// GetCertificate to enable zero-downtime certificate rotation.
-func GetCertificateFunc(certSubject string, store CertStore) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+// GetCertificateFunc fetches the named certificate from the Windows store
+// immediately, returning an error if that initial fetch fails so that servers
+// can abort startup before accepting any requests. On success it returns a
+// tls.Config.GetCertificate callback that caches the certificate and
+// automatically refreshes it when it is within 7 days of expiry, enabling
+// zero-downtime certificate rotation.
+//
+// The returned io.Closer releases the Windows store handles held by the
+// currently-cached certificate. Call it after the server has finished draining
+// connections (e.g. after http.Server.Shutdown returns).
+func GetCertificateFunc(certSubject string, store CertStore) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
 	return cert.GetCertificateFunc(certSubject, store)
 }
 
