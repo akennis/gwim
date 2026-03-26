@@ -66,7 +66,7 @@ func SetUserGroups(r *http.Request, groups []string) *http.Request {
 // using Kerberos or NTLM, and then calls the next handler in the chain.
 // The useNTLM boolean determines which authentication method to use.
 // If useNTLM is true, NTLM is used. Otherwise, Kerberos is used.
-func NewSSPIHandler(next http.Handler, useNTLM bool, options ...auth.AuthOptions) (http.Handler, error) {
+func NewSSPIHandler(next http.Handler, useNTLM bool, options ...auth.AuthErrorHandlers) (http.Handler, error) {
 	serverCreds, err := sspi.AcquireCredentials("", "Negotiate", sspi.SECPKG_CRED_INBOUND, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire credentials for SPNEGO: %w", err)
@@ -82,11 +82,33 @@ func NewSSPIHandler(next http.Handler, useNTLM bool, options ...auth.AuthOptions
 	return handler, nil
 }
 
-// GetCertificate retrieves a TLS certificate from the Windows certificate store.
-// The certSubject is the subject of the certificate to use. The fromCurrentUser
-// parameter determines whether to search the CurrentUser or LocalMachine store.
-func GetCertificate(certSubject string, fromCurrentUser bool) (tls.Certificate, error) {
-	return cert.GetWin32Cert(certSubject, fromCurrentUser)
+// CertStore identifies which Windows certificate store to search.
+// Use CertStoreLocalMachine or CertStoreCurrentUser.
+type CertStore = cert.CertStore
+
+const (
+	// CertStoreLocalMachine searches the LocalMachine certificate store (default).
+	CertStoreLocalMachine CertStore = cert.StoreLocalMachine
+	// CertStoreCurrentUser searches the CurrentUser certificate store.
+	CertStoreCurrentUser CertStore = cert.StoreCurrentUser
+)
+
+// GetCertificate retrieves a TLS certificate from the Windows certificate store
+// by Common Name. The certificate is validated (expiry, EKU, chain) before
+// being returned. The returned CertificateSource must be closed on server
+// shutdown to release Windows store handles.
+//
+// For zero-downtime certificate rotation, use GetCertificateFunc instead.
+func GetCertificate(certSubject string, store CertStore) (*cert.CertificateSource, error) {
+	return cert.GetWin32Cert(certSubject, store)
+}
+
+// GetCertificateFunc returns a tls.Config.GetCertificate callback that fetches
+// the named certificate from the Windows store with caching and automatic
+// refresh when the certificate is within 7 days of expiry. Use this instead of
+// GetCertificate to enable zero-downtime certificate rotation.
+func GetCertificateFunc(certSubject string, store CertStore) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	return cert.GetCertificateFunc(certSubject, store)
 }
 
 // ConfigureNTLM configures the http.Server with the ConnContext required for NTLM.
@@ -99,7 +121,7 @@ func ConfigureNTLM(server *http.Server) {
 
 // NewLdapGroupProvider returns a new http.Handler that enriches the request context
 // with the user's LDAP groups.
-func NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, options ...auth.AuthOptions) http.Handler {
+func NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, options ...auth.AuthErrorHandlers) http.Handler {
 	ldapServerInfo := auth.LdapServerInfo{
 		Address:           ldapAddress,
 		UsersDN:           ldapUsersDN,

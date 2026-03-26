@@ -149,7 +149,7 @@ func TestNtlmAuthn(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			authCache := cache.New(1*time.Minute, 2*time.Minute)
-			handler := ntlmAuthn(nil, tt.mockProvider, authCache, DefaultAuthOptions())
+			handler := ntlmAuthn(nil, tt.mockProvider, authCache, DefaultAuthErrorHandlers())
 			nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				username, _ := r.Context().Value(ContextKeyUsername).(string)
 				if username != tt.expectedUser {
@@ -201,7 +201,7 @@ func TestNtlmAuthn(t *testing.T) {
 }
 
 func TestNtlmAuthn_CustomHandlers(t *testing.T) {
-	opts := AuthOptions{
+	opts := AuthErrorHandlers{
 		OnGeneralError: func(w http.ResponseWriter, r *http.Request, err error) {
 			w.WriteHeader(http.StatusTeapot)
 		},
@@ -228,7 +228,7 @@ func TestNtlmAuthn_CacheEviction(t *testing.T) {
 
 	// Setup eviction callback
 	np := &mockNtlmProvider{contexts: []*mockNtlmServerContext{mockCtx}}
-	ntlmAuthn(nil, np, authCache, DefaultAuthOptions())
+	ntlmAuthn(nil, np, authCache, DefaultAuthErrorHandlers())
 
 	authCache.Set("N123", mockCtx, cache.DefaultExpiration)
 

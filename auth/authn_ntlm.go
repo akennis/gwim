@@ -70,17 +70,17 @@ func getSSPIUsername(sctxt *sspi.CtxtHandle) (string, error) {
 	return syscall.UTF16ToString((*[2 << 20]uint16)(unsafe.Pointer(n.UserName))[:]), nil
 }
 
-func NtlmAuthn(serverCreds *sspi.Credentials, options ...AuthOptions) func(http.Handler) http.Handler {
+func NtlmAuthn(serverCreds *sspi.Credentials, errHndlrs ...AuthErrorHandlers) func(http.Handler) http.Handler {
 	authCache := cache.New(1*time.Minute, 2*time.Minute)
-	var opts AuthOptions
-	if len(options) > 0 {
-		opts = options[0]
+	var opts AuthErrorHandlers
+	if len(errHndlrs) > 0 {
+		opts = errHndlrs[0]
 	}
 	opts.ApplyGeneralError()
 	return ntlmAuthn(serverCreds, &defaultNtlmProvider{}, authCache, opts)
 }
 
-func ntlmAuthn(serverCreds *sspi.Credentials, np ntlmProvider, authCache *cache.Cache, opts AuthOptions) func(http.Handler) http.Handler {
+func ntlmAuthn(serverCreds *sspi.Credentials, np ntlmProvider, authCache *cache.Cache, opts AuthErrorHandlers) func(http.Handler) http.Handler {
 	authCache.OnEvicted(func(k string, v interface{}) {
 		if s, ok := v.(ntlmServerContext); ok {
 			s.Release()

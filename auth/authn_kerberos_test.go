@@ -111,7 +111,7 @@ func TestKerberosAuthn(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := kerberosAuthn(nil, tt.mockProvider, DefaultAuthOptions())
+			handler := kerberosAuthn(nil, tt.mockProvider, DefaultAuthErrorHandlers())
 			nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				username, _ := r.Context().Value(ContextKeyUsername).(string)
 				if username != tt.expectedUser {
@@ -147,7 +147,7 @@ func TestKerberosAuthn(t *testing.T) {
 func TestKerberosAuthn_CustomHandlers(t *testing.T) {
 	var capturedErr error
 
-	opts := AuthOptions{
+	opts := AuthErrorHandlers{
 		OnGeneralError: func(w http.ResponseWriter, r *http.Request, err error) {
 			capturedErr = err
 			w.WriteHeader(http.StatusTeapot)

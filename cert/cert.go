@@ -2,51 +2,185 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build windows
+
 package cert
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/certtostore"
 )
 
-// GetWin32Cert retrieves a certificate from the Windows certificate store by subject string
-// and returns a tls.Certificate using github.com/google/certtostore for lookup and signing.
-// The fromCurrentUser parameter determines whether to search the CurrentUser or LocalMachine store.
-func GetWin32Cert(subject string, fromCurrentUser bool) (tls.Certificate, error) {
-	// 1. Initialize certtostore WinCertStore to manage the certificate store access
+// CertStore identifies which Windows certificate store to search.
+type CertStore int
+
+const (
+	// StoreLocalMachine searches the LocalMachine certificate store.
+	StoreLocalMachine CertStore = iota
+	// StoreCurrentUser searches the CurrentUser certificate store.
+	StoreCurrentUser
+)
+
+// RefreshThreshold is the duration before a certificate's expiry at which
+// GetCertificateFunc will transparently fetch a fresh certificate from the store.
+const RefreshThreshold = 7 * 24 * time.Hour
+
+// CertificateSource holds a TLS certificate retrieved from the Windows store along
+// with the underlying store handles required to keep the private key signer valid.
+// Call Close when the certificate is no longer needed (e.g. on server shutdown).
+type CertificateSource struct {
+	// Certificate is the validated tls.Certificate, ready for use in tls.Config.
+	Certificate tls.Certificate
+	wcs         *certtostore.WinCertStore
+}
+
+// Close releases the Windows certificate store handles held by this source.
+func (cs *CertificateSource) Close() error {
+	return cs.wcs.Close()
+}
+
+// GetWin32Cert retrieves a certificate from the Windows certificate store by
+// Common Name and returns a CertificateSource.
+//
+// The certificate is validated before being returned: it must not be expired and
+// must carry the ExtKeyUsageServerAuth extended key usage. The returned
+// tls.Certificate includes the full chain (leaf + intermediates, no root).
+//
+// The caller must call Close on the returned CertificateSource when it is no
+// longer needed (e.g. on server shutdown) to release Windows store handles.
+//
+// For servers that need zero-downtime certificate rotation, use GetCertificateFunc
+// instead of calling GetWin32Cert once at startup.
+func GetWin32Cert(subject string, store CertStore) (*CertificateSource, error) {
+	fromCurrentUser := store == StoreCurrentUser
+	storeName := "LocalMachine"
+	if fromCurrentUser {
+		storeName = "CurrentUser"
+	}
+
 	wcs, err := certtostore.OpenWinCertStoreWithOptions(certtostore.WinCertStoreOptions{
 		CurrentUser: fromCurrentUser,
 		StoreFlags:  certtostore.CertStoreReadOnly,
 	})
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("failed to open certtostore: %v", err)
+		return nil, fmt.Errorf("failed to open %s cert store: %w", storeName, err)
 	}
-	// NOTE: We DO NOT defer wcs.Close() here.
-	// The store and provider must remain open for the certificate signer to function.
 
-	// 2. Find Certificate and context by Common Name (Subject) using native library method
-	cert, ctx, _, err := wcs.CertByCommonName(subject)
+	leaf, ctx, _, err := wcs.CertByCommonName(subject)
 	if err != nil {
-		storeName := "LocalMachine"
-		if fromCurrentUser {
-			storeName = "CurrentUser"
-		}
-		return tls.Certificate{}, fmt.Errorf("certificate with subject %q not found in %s: %v", subject, storeName, err)
+		wcs.Close()
+		return nil, fmt.Errorf("certificate with subject %q not found in %s: %w", subject, storeName, err)
 	}
-	// NOTE: We DO NOT defer FreeCertContext(ctx) here.
-	// The context must remain alive so that the private key handle stays valid.
 
-	// 3. Use certtostore to acquire the crypto.Signer for this certificate context
+	// Validate the certificate: checks expiry, EKU (ServerAuth), and chain integrity.
+	// x509.Verify uses the Windows certificate verification API on Windows, which
+	// resolves and validates the full issuer chain from the system store.
+	chains, err := leaf.Verify(x509.VerifyOptions{
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	if err != nil {
+		wcs.Close()
+		return nil, fmt.Errorf("certificate %q in %s failed validation: %w", subject, storeName, err)
+	}
+
+	// Build the DER-encoded chain for tls.Certificate: leaf + any intermediates.
+	// The root CA is excluded — clients are expected to have it in their trust store.
+	chain := chains[0]
+	// Exclude the root CA; for self-signed certs include at least the leaf.
+	rawLen := max(len(chain)-1, 1)
+	rawChain := make([][]byte, rawLen)
+	for i := range rawLen {
+		rawChain[i] = chain[i].Raw
+	}
+
+	// NOTE: wcs and ctx are intentionally kept open. The signer returned by
+	// CertKey holds a reference to the Windows key provider, which requires
+	// both the store handle and the cert context to remain alive for signing
+	// operations. They are released when Close is called on the returned source.
 	signer, err := wcs.CertKey(ctx)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("failed to acquire private key via certtostore: %v", err)
+		wcs.Close()
+		return nil, fmt.Errorf("failed to acquire private key for %q in %s: %w", subject, storeName, err)
 	}
 
-	// 4. Get the raw DER bytes from the parsed certificate.
-	return tls.Certificate{
-		Certificate: [][]byte{cert.Raw},
-		PrivateKey:  signer,
+	return &CertificateSource{
+		Certificate: tls.Certificate{
+			Certificate: rawChain,
+			PrivateKey:  signer,
+		},
+		wcs: wcs,
 	}, nil
+}
+
+// cachedCert pairs a CertificateSource with its parsed leaf expiry so that
+// both values are always read and written together as a single atomic unit.
+type cachedCert struct {
+	source *CertificateSource
+	expiry time.Time
+}
+
+// GetCertificateFunc returns a tls.Config.GetCertificate callback that fetches
+// the named certificate from the Windows store, caches it, and transparently
+// refreshes the cache when the certificate is within RefreshThreshold of expiry.
+//
+// Using this function instead of GetWin32Cert once at startup enables
+// zero-downtime certificate rotation: renewing the cert in the Windows store
+// is sufficient — no server restart is required.
+//
+// The callback is safe for concurrent use. The hot path (cache hit) is
+// lock-free: it performs a single atomic pointer load and a time comparison.
+// The mutex is only acquired on the slow path when a refresh is needed, and
+// double-checked locking prevents multiple goroutines from refreshing
+// simultaneously. When a refresh fails, the cached (possibly stale) certificate
+// is returned so that the server continues serving rather than failing abruptly.
+func GetCertificateFunc(subject string, store CertStore) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	var (
+		mu     sync.Mutex
+		cached atomic.Pointer[cachedCert]
+	)
+
+	return func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		// Hot path: a single atomic pointer load — no lock required.
+		if c := cached.Load(); c != nil && time.Until(c.expiry) >= RefreshThreshold {
+			return &c.source.Certificate, nil
+		}
+
+		// Slow path: serialize refreshes to avoid a thundering herd.
+		mu.Lock()
+		defer mu.Unlock()
+
+		// Re-check after acquiring the lock; another goroutine may have already
+		// completed a refresh while this one was waiting.
+		if c := cached.Load(); c != nil && time.Until(c.expiry) >= RefreshThreshold {
+			return &c.source.Certificate, nil
+		}
+
+		fresh, err := GetWin32Cert(subject, store)
+		if err != nil {
+			if c := cached.Load(); c != nil {
+				// Best-effort: return the stale cert rather than failing.
+				return &c.source.Certificate, nil
+			}
+			return nil, err
+		}
+
+		// Parse the leaf once to cache its expiry. The cert bytes are guaranteed
+		// valid here — GetWin32Cert already called x509.Verify on them.
+		leaf, _ := x509.ParseCertificate(fresh.Certificate.Certificate[0])
+
+		// Atomically publish the new cert and its expiry as a single unit, so
+		// readers on the hot path can never observe a mismatched pair.
+		// The previous source is not explicitly closed here because ongoing TLS
+		// sessions may still be using its private key signer. The Windows store
+		// handles it held will be released once the Go runtime garbage-collects
+		// the old signer.
+		cached.Store(&cachedCert{source: fresh, expiry: leaf.NotAfter})
+		return &fresh.Certificate, nil
+	}
 }

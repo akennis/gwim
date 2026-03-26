@@ -42,7 +42,7 @@ func main() {
 
 	// LDAP Group Provider (Optional): Enriches context with group info.
 	if *ldapAddress != "" {
-		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN, auth.AuthOptions{
+		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN, auth.AuthErrorHandlers{
 			OnGeneralError: onMinAuthError,
 		})
 		log.Println("AUTHN/Z: --> Applied LDAP group provider")
@@ -50,7 +50,7 @@ func main() {
 
 	// SSPI Handler: Performs Windows Authentication (Kerberos/NTLM).
 	// This is the core of the gwim API.
-	handler, err := gwim.NewSSPIHandler(handler, useNTLM, auth.AuthOptions{
+	handler, err := gwim.NewSSPIHandler(handler, useNTLM, auth.AuthErrorHandlers{
 		OnGeneralError: onMinAuthError,
 	})
 	if err != nil {
@@ -58,19 +58,20 @@ func main() {
 	}
 	log.Println("AUTHN/Z: --> Applied SSPI handler (Kerberos/NTLM)")
 
-	// gwim provides a helper to retrieve a certificate from the Windows store for TLS
-	certificate, err := gwim.GetCertificate(*certSubject, *certFromCurrentUser)
-	if err != nil {
-		log.Fatalf("Failed to retrieve certificate: %v", err)
+	certStore := gwim.CertStoreLocalMachine
+	if *certFromCurrentUser {
+		certStore = gwim.CertStoreCurrentUser
 	}
 
-	// Configure HTTPS server
+	// Configure HTTPS server.
+	// GetCertificateFunc fetches the cert from the Windows store and caches it,
+	// automatically refreshing it when it is within 7 days of expiry.
 	srv := &http.Server{
 		Addr:    *serverAddr,
 		Handler: handler,
 		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{certificate},
-			MinVersion:   tls.VersionTLS13,
+			GetCertificate: gwim.GetCertificateFunc(*certSubject, certStore),
+			MinVersion:     tls.VersionTLS13,
 		},
 	}
 

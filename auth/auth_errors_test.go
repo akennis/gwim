@@ -14,7 +14,7 @@ import (
 func TestAuthOptions_CustomHandlers(t *testing.T) {
 	t.Run("OnGeneralError_Catchall", func(t *testing.T) {
 		called := false
-		opts := AuthOptions{
+		opts := AuthErrorHandlers{
 			OnGeneralError: func(w http.ResponseWriter, r *http.Request, err error) {
 				called = true
 				http.Error(w, "General Error", http.StatusTeapot)
@@ -37,7 +37,7 @@ func TestAuthOptions_CustomHandlers(t *testing.T) {
 	t.Run("SpecificHandlerTakesPrecedence", func(t *testing.T) {
 		generalCalled := false
 		specificCalled := false
-		opts := AuthOptions{
+		opts := AuthErrorHandlers{
 			OnUnauthorized: func(w http.ResponseWriter, r *http.Request, err error) {
 				specificCalled = true
 				w.WriteHeader(http.StatusForbidden)

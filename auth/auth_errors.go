@@ -9,8 +9,8 @@ import "net/http"
 // AuthErrorHandler is a function that handles an authentication error.
 type AuthErrorHandler func(w http.ResponseWriter, r *http.Request, err error)
 
-// AuthOptions allows customizing the behavior of the authentication handlers.
-type AuthOptions struct {
+// AuthErrorHandlers allows customizing the behavior of the authentication handlers.
+type AuthErrorHandlers struct {
 	// OnUnauthorized is called when the authentication header is missing or invalid.
 	OnUnauthorized AuthErrorHandler
 	// OnInvalidToken is called when the base64 token provided by the client is malformed.
@@ -27,9 +27,9 @@ type AuthOptions struct {
 	OnLdapLookupError AuthErrorHandler
 }
 
-// DefaultAuthOptions returns the default authentication options with hardcoded behaviors.
-func DefaultAuthOptions() AuthOptions {
-	return AuthOptions{
+// DefaultAuthErrorHandlers returns the default authentication options with hardcoded behaviors.
+func DefaultAuthErrorHandlers() AuthErrorHandlers {
+	return AuthErrorHandlers{
 		OnUnauthorized: func(w http.ResponseWriter, r *http.Request, err error) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		},
@@ -52,7 +52,7 @@ func DefaultAuthOptions() AuthOptions {
 }
 
 // ApplyGeneralError applies the OnGeneralError handler to any unset specific handlers.
-func (o *AuthOptions) ApplyGeneralError() {
+func (o *AuthErrorHandlers) ApplyGeneralError() {
 	if o.OnGeneralError == nil {
 		return
 	}
@@ -77,49 +77,49 @@ func (o *AuthOptions) ApplyGeneralError() {
 }
 
 // GetOnUnauthorized returns the OnUnauthorized handler or the default.
-func (o AuthOptions) GetOnUnauthorized() AuthErrorHandler {
+func (o AuthErrorHandlers) GetOnUnauthorized() AuthErrorHandler {
 	if o.OnUnauthorized != nil {
 		return o.OnUnauthorized
 	}
-	return DefaultAuthOptions().OnUnauthorized
+	return DefaultAuthErrorHandlers().OnUnauthorized
 }
 
 // GetOnInvalidToken returns the OnInvalidToken handler or the default.
-func (o AuthOptions) GetOnInvalidToken() AuthErrorHandler {
+func (o AuthErrorHandlers) GetOnInvalidToken() AuthErrorHandler {
 	if o.OnInvalidToken != nil {
 		return o.OnInvalidToken
 	}
-	return DefaultAuthOptions().OnInvalidToken
+	return DefaultAuthErrorHandlers().OnInvalidToken
 }
 
 // GetOnAuthFailed returns the OnAuthFailed handler or the default.
-func (o AuthOptions) GetOnAuthFailed() AuthErrorHandler {
+func (o AuthErrorHandlers) GetOnAuthFailed() AuthErrorHandler {
 	if o.OnAuthFailed != nil {
 		return o.OnAuthFailed
 	}
-	return DefaultAuthOptions().OnAuthFailed
+	return DefaultAuthErrorHandlers().OnAuthFailed
 }
 
 // GetOnIdentityError returns the OnIdentityError handler or the default.
-func (o AuthOptions) GetOnIdentityError() AuthErrorHandler {
+func (o AuthErrorHandlers) GetOnIdentityError() AuthErrorHandler {
 	if o.OnIdentityError != nil {
 		return o.OnIdentityError
 	}
-	return DefaultAuthOptions().OnIdentityError
+	return DefaultAuthErrorHandlers().OnIdentityError
 }
 
 // GetOnLdapConnectionError returns the OnLdapConnectionError handler or the default.
-func (o AuthOptions) GetOnLdapConnectionError() AuthErrorHandler {
+func (o AuthErrorHandlers) GetOnLdapConnectionError() AuthErrorHandler {
 	if o.OnLdapConnectionError != nil {
 		return o.OnLdapConnectionError
 	}
-	return DefaultAuthOptions().OnLdapConnectionError
+	return DefaultAuthErrorHandlers().OnLdapConnectionError
 }
 
 // GetOnLdapLookupError returns the OnLdapLookupError handler or the default.
-func (o AuthOptions) GetOnLdapLookupError() AuthErrorHandler {
+func (o AuthErrorHandlers) GetOnLdapLookupError() AuthErrorHandler {
 	if o.OnLdapLookupError != nil {
 		return o.OnLdapLookupError
 	}
-	return DefaultAuthOptions().OnLdapLookupError
+	return DefaultAuthErrorHandlers().OnLdapLookupError
 }
