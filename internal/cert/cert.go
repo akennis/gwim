@@ -37,7 +37,11 @@ type CertificateSource struct {
 }
 
 // Close releases the Windows certificate store handles held by this source.
+// It is a no-op if the source was not backed by a real store (e.g. in tests).
 func (cs *CertificateSource) Close() error {
+	if cs.wcs == nil {
+		return nil
+	}
 	return cs.wcs.Close()
 }
 
@@ -135,6 +139,11 @@ func (c *certCloser) Close() error {
 	return nil
 }
 
+// certFetcher is the signature of the function used to retrieve a certificate
+// from a store. The indirection allows unit tests to supply in-memory
+// certificates without requiring a real Windows certificate store.
+type certFetcher func(subject string, store CertStore) (*CertificateSource, error)
+
 // GetCertificateFunc fetches the named certificate from the Windows store
 // immediately at call time, returning an error if that initial fetch fails so
 // that servers can abort startup before accepting any requests. On success it
@@ -157,10 +166,16 @@ func (c *certCloser) Close() error {
 // the refresh-pending path perform only atomic pointer loads — no mutex is
 // ever held on the request path.
 func GetCertificateFunc(subject string, store CertStore, refreshThreshold time.Duration) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
+	return newCertificateFunc(subject, store, refreshThreshold, GetWin32Cert)
+}
+
+// newCertificateFunc is the testable core of GetCertificateFunc. It accepts a
+// certFetcher so that unit tests can inject in-memory certificates.
+func newCertificateFunc(subject string, store CertStore, refreshThreshold time.Duration, fetch certFetcher) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
 	// Eagerly fetch the certificate now so that configuration errors (wrong
 	// subject, missing cert, validation failure) are surfaced at startup rather
 	// than on the first TLS handshake.
-	initial, err := GetWin32Cert(subject, store)
+	initial, err := fetch(subject, store)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -190,7 +205,7 @@ func GetCertificateFunc(subject string, store CertStore, refreshThreshold time.D
 			go func() {
 				defer refreshing.Store(false)
 
-				fresh, err := GetWin32Cert(subject, store)
+				fresh, err := fetch(subject, store)
 				if err != nil {
 					// Keep serving the cached cert; the next request will retry.
 					return
