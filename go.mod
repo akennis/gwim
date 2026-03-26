@@ -7,6 +7,7 @@ require (
 	github.com/go-ldap/ldap/v3 v3.4.10
 	github.com/google/certtostore v1.0.6
 	github.com/patrickmn/go-cache v2.1.0+incompatible
+	golang.org/x/sys v0.28.0
 )
 
 require (
@@ -17,5 +18,4 @@ require (
 	github.com/google/deck v0.0.0-20230104221208-105ad94aa8ae // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	golang.org/x/crypto v0.31.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
 )

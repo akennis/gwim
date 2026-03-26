@@ -7,6 +7,7 @@
 package cert
 
 import (
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -15,7 +16,48 @@ import (
 	"time"
 
 	"github.com/google/certtostore"
+	"golang.org/x/sys/windows"
 )
+
+// winCertStore abstracts the certtostore.WinCertStore operations used by
+// GetWin32Cert, enabling unit tests to inject in-memory certificate lookups
+// without requiring a real Windows certificate store.
+//
+// The cert context exchanged between CertByCommonName and CertKey is typed as
+// any to keep *windows.CertContext out of the interface, limiting the
+// Windows-specific type to the adapter implementation below.
+type winCertStore interface {
+	CertByCommonName(cn string) (*x509.Certificate, any, [][]*x509.Certificate, error)
+	CertKey(ctx any) (crypto.Signer, error)
+	Close() error
+}
+
+// winCertStoreAdapter adapts *certtostore.WinCertStore to the winCertStore
+// interface, handling the *windows.CertContext type conversion internally.
+type winCertStoreAdapter struct {
+	wcs *certtostore.WinCertStore
+}
+
+func (a *winCertStoreAdapter) CertByCommonName(cn string) (*x509.Certificate, any, [][]*x509.Certificate, error) {
+	return a.wcs.CertByCommonName(cn)
+}
+
+func (a *winCertStoreAdapter) CertKey(ctx any) (crypto.Signer, error) {
+	certCtx, _ := ctx.(*windows.CertContext)
+	return a.wcs.CertKey(certCtx)
+}
+
+func (a *winCertStoreAdapter) Close() error {
+	return a.wcs.Close()
+}
+
+// storeOpener is the function signature for opening a Windows certificate
+// store. The indirection allows unit tests to supply a mock store.
+type storeOpener func(certtostore.WinCertStoreOptions) (winCertStore, error)
+
+// certVerifier abstracts x509.Certificate.Verify, enabling unit tests to
+// control the validated chain without hitting the Windows CryptoAPI.
+type certVerifier func(*x509.Certificate, x509.VerifyOptions) ([][]*x509.Certificate, error)
 
 // CertStore identifies which Windows certificate store to search.
 type CertStore int
@@ -33,7 +75,7 @@ const (
 type CertificateSource struct {
 	// Certificate is the validated tls.Certificate, ready for use in tls.Config.
 	Certificate tls.Certificate
-	wcs         *certtostore.WinCertStore
+	wcs         winCertStore
 }
 
 // Close releases the Windows certificate store handles held by this source.
@@ -58,13 +100,31 @@ func (cs *CertificateSource) Close() error {
 // For servers that need zero-downtime certificate rotation, use GetCertificateFunc
 // instead of calling GetWin32Cert once at startup.
 func GetWin32Cert(subject string, store CertStore) (*CertificateSource, error) {
+	return getWin32CertWith(subject, store,
+		func(opts certtostore.WinCertStoreOptions) (winCertStore, error) {
+			wcs, err := certtostore.OpenWinCertStoreWithOptions(opts)
+			if err != nil {
+				return nil, err
+			}
+			return &winCertStoreAdapter{wcs}, nil
+		},
+		func(leaf *x509.Certificate, opts x509.VerifyOptions) ([][]*x509.Certificate, error) {
+			return leaf.Verify(opts)
+		},
+	)
+}
+
+// getWin32CertWith is the testable core of GetWin32Cert. It accepts a
+// storeOpener and certVerifier so that unit tests can inject in-memory
+// certificate stores and chains without requiring a real Windows environment.
+func getWin32CertWith(subject string, store CertStore, open storeOpener, verify certVerifier) (*CertificateSource, error) {
 	fromCurrentUser := store == StoreCurrentUser
 	storeName := "LocalMachine"
 	if fromCurrentUser {
 		storeName = "CurrentUser"
 	}
 
-	wcs, err := certtostore.OpenWinCertStoreWithOptions(certtostore.WinCertStoreOptions{
+	wcs, err := open(certtostore.WinCertStoreOptions{
 		CurrentUser: fromCurrentUser,
 		StoreFlags:  certtostore.CertStoreReadOnly,
 	})
@@ -81,7 +141,7 @@ func GetWin32Cert(subject string, store CertStore) (*CertificateSource, error) {
 	// Validate the certificate: checks expiry, EKU (ServerAuth), and chain integrity.
 	// x509.Verify uses the Windows certificate verification API on Windows, which
 	// resolves and validates the full issuer chain from the system store.
-	chains, err := leaf.Verify(x509.VerifyOptions{
+	chains, err := verify(leaf, x509.VerifyOptions{
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	})
 	if err != nil {
