@@ -249,8 +249,6 @@ func TestLdapGroupProvider(t *testing.T) {
 		req := httptest.NewRequest("GET", "/", nil)
 		ctx := context.WithValue(req.Context(), ContextKeyUsername, "testuser")
 		req = req.WithContext(ctx)
-		// Fix ContextKeyUsername which might be a custom type
-		// For testing purposes, we assume ContextKeyUsername is available in auth package.
 
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, req)
@@ -260,7 +258,3 @@ func TestLdapGroupProvider(t *testing.T) {
 		}
 	})
 }
-
-// fmt.WithValue is a typo, should be context.WithValue.
-// Also need to make sure ContextKeyUsername/ContextKeyUserGroups are accessible.
-// Since they are in the same package 'auth', they should be accessible.

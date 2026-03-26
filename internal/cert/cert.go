@@ -28,9 +28,9 @@ const (
 	StoreCurrentUser
 )
 
-// RefreshThreshold is the duration before a certificate's expiry at which
+// refreshThreshold is the duration before a certificate's expiry at which
 // GetCertificateFunc will transparently fetch a fresh certificate from the store.
-const RefreshThreshold = 7 * 24 * time.Hour
+const refreshThreshold = 7 * 24 * time.Hour
 
 // CertificateSource holds a TLS certificate retrieved from the Windows store along
 // with the underlying store handles required to keep the private key signer valid.
@@ -145,7 +145,7 @@ func (c *certCloser) Close() error {
 // that servers can abort startup before accepting any requests. On success it
 // returns a tls.Config.GetCertificate callback that serves the cached
 // certificate and transparently refreshes it when the certificate is within
-// RefreshThreshold of expiry, enabling zero-downtime certificate rotation.
+// refreshThreshold of expiry, enabling zero-downtime certificate rotation.
 //
 // The returned io.Closer releases the Windows store handles held by the
 // currently-cached certificate. It should be called after the server has
@@ -175,7 +175,7 @@ func GetCertificateFunc(subject string, store CertStore) (func(*tls.ClientHelloI
 
 	getCert := func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		// Hot path: a single atomic pointer load — no lock required.
-		if c := cached.Load(); c != nil && time.Until(c.expiry) >= RefreshThreshold {
+		if c := cached.Load(); c != nil && time.Until(c.expiry) >= refreshThreshold {
 			return &c.source.Certificate, nil
 		}
 
@@ -185,7 +185,7 @@ func GetCertificateFunc(subject string, store CertStore) (func(*tls.ClientHelloI
 
 		// Re-check after acquiring the lock; another goroutine may have already
 		// completed a refresh while this one was waiting.
-		if c := cached.Load(); c != nil && time.Until(c.expiry) >= RefreshThreshold {
+		if c := cached.Load(); c != nil && time.Until(c.expiry) >= refreshThreshold {
 			return &c.source.Certificate, nil
 		}
 

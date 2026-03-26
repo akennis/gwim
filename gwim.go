@@ -15,59 +15,72 @@ import (
 	"net/http"
 	"sync/atomic"
 
-	"github.com/akennis/gwim/auth"
-	"github.com/akennis/gwim/cert"
+	iauth "github.com/akennis/gwim/internal/auth"
+	icert "github.com/akennis/gwim/internal/cert"
 	"github.com/alexbrainman/sspi"
 )
 
-// Exported keys for context access
-const (
-	ContextKeyConnID = auth.ContextKeyConnID
-)
+// --- Re-exported types ---
+//
+// These type aliases are the only way callers should interact with the types
+// defined in the internal packages. Importing github.com/akennis/gwim is the
+// only import required to use this library.
 
-// User returns the username from the request context.
-// The second return value is true if the user was found in the context.
+// AuthErrorHandler is a function type for handling an authentication or
+// authorisation error. Assign one to any field of AuthErrorHandlers to
+// override the default behaviour for that specific error category.
+type AuthErrorHandler = iauth.AuthErrorHandler
+
+// AuthErrorHandlers configures the error-handling behaviour of the
+// authentication middleware. Pass one as a variadic option to NewSSPIHandler
+// or NewLdapGroupProvider. Any field left nil falls back to the built-in
+// default for that category; set OnGeneralError as a single catch-all.
+type AuthErrorHandlers = iauth.AuthErrorHandlers
+
+// --- Context helpers ---
+
+// User returns the authenticated username from the request context.
+// The second return value is false if no user has been set.
 func User(r *http.Request) (string, bool) {
-	username, ok := r.Context().Value(auth.ContextKeyUsername).(string)
+	username, ok := r.Context().Value(iauth.ContextKeyUsername).(string)
 	if !ok || username == "" {
 		return "", false
 	}
 	return username, true
 }
 
-// SetUser adds the username to the request context and returns the modified request.
-// This allows an application to manage sessions itself and inject the user's
-// identity into the context, bypassing the need for per-request authentication.
+// SetUser injects a username into the request context, normalising it first.
+// Use this to resume a session without re-running SSPI authentication.
 func SetUser(r *http.Request, username string) *http.Request {
-	username = auth.NormalizeUsername(username)
-	ctx := context.WithValue(r.Context(), auth.ContextKeyUsername, username)
+	username = iauth.NormalizeUsername(username)
+	ctx := context.WithValue(r.Context(), iauth.ContextKeyUsername, username)
 	return r.WithContext(ctx)
 }
 
-// UserGroups returns the user's groups from the request context.
-// The second return value is true if the groups were found in the context.
+// UserGroups returns the authenticated user's group memberships from the
+// request context. The second return value is false if no groups are present.
 func UserGroups(r *http.Request) ([]string, bool) {
-	groups, ok := r.Context().Value(auth.ContextKeyUserGroups).([]string)
+	groups, ok := r.Context().Value(iauth.ContextKeyUserGroups).([]string)
 	if !ok {
 		return nil, false
 	}
 	return groups, true
 }
 
-// SetUserGroups adds the user's group memberships to the request context and
-// returns the modified request. This allows an application to manage group
-// caching itself and inject the groups into the context, bypassing the need for
-// the LdapGroupProvider to perform a query.
+// SetUserGroups injects group memberships into the request context.
+// Use this to resume a session with cached groups without re-running LDAP.
 func SetUserGroups(r *http.Request, groups []string) *http.Request {
-	ctx := context.WithValue(r.Context(), auth.ContextKeyUserGroups, groups)
+	ctx := context.WithValue(r.Context(), iauth.ContextKeyUserGroups, groups)
 	return r.WithContext(ctx)
 }
 
-// NewSSPIHandler returns a new http.Handler that authenticates requests
-// using Kerberos or NTLM, and then calls the next handler in the chain.
-// The useNTLM boolean determines which authentication method to use.
-// If useNTLM is true, NTLM is used. Otherwise, Kerberos is used.
-func NewSSPIHandler(next http.Handler, useNTLM bool, options ...auth.AuthErrorHandlers) (http.Handler, error) {
+// --- Middleware constructors ---
+
+// NewSSPIHandler returns an http.Handler that authenticates each request
+// using Kerberos (useNTLM=false) or NTLM (useNTLM=true) via Windows SSPI,
+// then delegates to next. Pass an AuthErrorHandlers value to customise error
+// responses; any unset fields fall back to sensible defaults.
+func NewSSPIHandler(next http.Handler, useNTLM bool, options ...AuthErrorHandlers) (http.Handler, error) {
 	serverCreds, err := sspi.AcquireCredentials("", "Negotiate", sspi.SECPKG_CRED_INBOUND, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire credentials for SPNEGO: %w", err)
@@ -75,64 +88,61 @@ func NewSSPIHandler(next http.Handler, useNTLM bool, options ...auth.AuthErrorHa
 
 	var handler http.Handler
 	if useNTLM {
-		handler = auth.NtlmAuthn(serverCreds, options...)(next)
+		handler = iauth.NtlmAuthn(serverCreds, options...)(next)
 	} else {
-		handler = auth.KerberosAuthn(serverCreds, options...)(next)
+		handler = iauth.KerberosAuthn(serverCreds, options...)(next)
 	}
 
 	return handler, nil
 }
 
-// CertStore identifies which Windows certificate store to search.
-// Use CertStoreLocalMachine or CertStoreCurrentUser.
-type CertStore = cert.CertStore
-
-const (
-	// CertStoreLocalMachine searches the LocalMachine certificate store (default).
-	CertStoreLocalMachine CertStore = cert.StoreLocalMachine
-	// CertStoreCurrentUser searches the CurrentUser certificate store.
-	CertStoreCurrentUser CertStore = cert.StoreCurrentUser
-)
-
-// GetCertificate retrieves a TLS certificate from the Windows certificate store
-// by Common Name. The certificate is validated (expiry, EKU, chain) before
-// being returned. The returned CertificateSource must be closed on server
-// shutdown to release Windows store handles.
-//
-// For zero-downtime certificate rotation, use GetCertificateFunc instead.
-func GetCertificate(certSubject string, store CertStore) (*cert.CertificateSource, error) {
-	return cert.GetWin32Cert(certSubject, store)
-}
-
-// GetCertificateFunc fetches the named certificate from the Windows store
-// immediately, returning an error if that initial fetch fails so that servers
-// can abort startup before accepting any requests. On success it returns a
-// tls.Config.GetCertificate callback that caches the certificate and
-// automatically refreshes it when it is within 7 days of expiry, enabling
-// zero-downtime certificate rotation.
-//
-// The returned io.Closer releases the Windows store handles held by the
-// currently-cached certificate. Call it after the server has finished draining
-// connections (e.g. after http.Server.Shutdown returns).
-func GetCertificateFunc(certSubject string, store CertStore) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
-	return cert.GetCertificateFunc(certSubject, store)
-}
-
-// ConfigureNTLM configures the http.Server with the ConnContext required for NTLM.
-func ConfigureNTLM(server *http.Server) {
-	connID := uint64(0)
-	server.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
-		return context.WithValue(ctx, auth.ContextKeyConnID, atomic.AddUint64(&connID, 1))
-	}
-}
-
-// NewLdapGroupProvider returns a new http.Handler that enriches the request context
-// with the user's LDAP groups.
-func NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, options ...auth.AuthErrorHandlers) http.Handler {
-	ldapServerInfo := auth.LdapServerInfo{
+// NewLdapGroupProvider returns an http.Handler that looks up the authenticated
+// user's Active Directory group memberships via LDAP and stores them in the
+// request context, then delegates to next.
+func NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, options ...AuthErrorHandlers) http.Handler {
+	ldapServerInfo := iauth.LdapServerInfo{
 		Address:           ldapAddress,
 		UsersDN:           ldapUsersDN,
 		ServiceAccountSPN: ldapServiceAccountSPN,
 	}
-	return auth.LdapGroupProvider(ldapServerInfo, options...)(next)
+	return iauth.LdapGroupProvider(ldapServerInfo, options...)(next)
+}
+
+// --- TLS certificate helpers ---
+
+// CertStore identifies which Windows certificate store to search.
+// Use CertStoreLocalMachine or CertStoreCurrentUser.
+type CertStore = icert.CertStore
+
+const (
+	// CertStoreLocalMachine searches the LocalMachine certificate store (default).
+	CertStoreLocalMachine CertStore = icert.StoreLocalMachine
+	// CertStoreCurrentUser searches the CurrentUser certificate store.
+	CertStoreCurrentUser CertStore = icert.StoreCurrentUser
+)
+
+// GetCertificateFunc fetches the named certificate from the Windows store
+// immediately — surfacing any configuration error at startup rather than on
+// the first TLS handshake — and returns a tls.Config.GetCertificate callback
+// that transparently refreshes the certificate when it is within 7 days of
+// expiry, enabling zero-downtime rotation.
+//
+// The returned io.Closer releases the Windows store handles for the
+// currently-cached certificate. Call it after http.Server.Shutdown returns
+// to ensure all active connections have already finished.
+func GetCertificateFunc(certSubject string, store CertStore) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
+	return icert.GetCertificateFunc(certSubject, store)
+}
+
+// --- Server configuration ---
+
+// ConfigureNTLM sets the ConnContext on server so that each connection is
+// assigned a unique ID. This ID is required by the NTLM handler to correlate
+// the two-round token exchange across separate HTTP requests on the same
+// keep-alive connection.
+func ConfigureNTLM(server *http.Server) {
+	connID := uint64(0)
+	server.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
+		return context.WithValue(ctx, iauth.ContextKeyConnID, atomic.AddUint64(&connID, 1))
+	}
 }

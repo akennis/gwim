@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/akennis/gwim"
-	"github.com/akennis/gwim/auth"
 	"github.com/patrickmn/go-cache"
 )
 
@@ -217,14 +216,14 @@ func main() {
 
 	// LDAP Group Provider: Enriches context with group info (runs after auth).
 	if *ldapAddress != "" {
-		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN, auth.AuthErrorHandlers{
+		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN, gwim.AuthErrorHandlers{
 			OnGeneralError: onSecAuthError,
 		})
 		log.Println("AUTHN/Z: --> Applied LDAP group provider")
 	}
 
 	// SSPI Handler: Performs Kerberos/NTLM auth if no user is in the context.
-	handler, err := gwim.NewSSPIHandler(handler, *useNTLM, auth.AuthErrorHandlers{
+	handler, err := gwim.NewSSPIHandler(handler, *useNTLM, gwim.AuthErrorHandlers{
 		OnGeneralError: onSecAuthError,
 	})
 	if err != nil {

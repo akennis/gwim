@@ -12,7 +12,6 @@ import (
 	"net/http"
 
 	"github.com/akennis/gwim"
-	"github.com/akennis/gwim/auth"
 )
 
 func main() {
@@ -40,7 +39,7 @@ func main() {
 
 	// LDAP Group Provider (Optional): Enriches context with group info.
 	if *ldapAddress != "" {
-		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN, auth.AuthErrorHandlers{
+		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN, gwim.AuthErrorHandlers{
 			OnGeneralError: onMinAuthError,
 		})
 		log.Println("AUTHN/Z: --> Applied LDAP group provider")
@@ -48,7 +47,7 @@ func main() {
 
 	// SSPI Handler: Performs Windows Authentication (Kerberos/NTLM).
 	// This is the core of the gwim API.
-	handler, err := gwim.NewSSPIHandler(handler, *useNTLM, auth.AuthErrorHandlers{
+	handler, err := gwim.NewSSPIHandler(handler, *useNTLM, gwim.AuthErrorHandlers{
 		OnGeneralError: onMinAuthError,
 	})
 	if err != nil {
