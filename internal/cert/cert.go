@@ -7,57 +7,15 @@
 package cert
 
 import (
-	"crypto"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/google/certtostore"
-	"golang.org/x/sys/windows"
 )
-
-// winCertStore abstracts the certtostore.WinCertStore operations used by
-// GetWin32Cert, enabling unit tests to inject in-memory certificate lookups
-// without requiring a real Windows certificate store.
-//
-// The cert context exchanged between CertByCommonName and CertKey is typed as
-// any to keep *windows.CertContext out of the interface, limiting the
-// Windows-specific type to the adapter implementation below.
-type winCertStore interface {
-	CertByCommonName(cn string) (*x509.Certificate, any, [][]*x509.Certificate, error)
-	CertKey(ctx any) (crypto.Signer, error)
-	Close() error
-}
-
-// winCertStoreAdapter adapts *certtostore.WinCertStore to the winCertStore
-// interface, handling the *windows.CertContext type conversion internally.
-type winCertStoreAdapter struct {
-	wcs *certtostore.WinCertStore
-}
-
-func (a *winCertStoreAdapter) CertByCommonName(cn string) (*x509.Certificate, any, [][]*x509.Certificate, error) {
-	return a.wcs.CertByCommonName(cn)
-}
-
-func (a *winCertStoreAdapter) CertKey(ctx any) (crypto.Signer, error) {
-	certCtx, _ := ctx.(*windows.CertContext)
-	return a.wcs.CertKey(certCtx)
-}
-
-func (a *winCertStoreAdapter) Close() error {
-	return a.wcs.Close()
-}
-
-// storeOpener is the function signature for opening a Windows certificate
-// store. The indirection allows unit tests to supply a mock store.
-type storeOpener func(certtostore.WinCertStoreOptions) (winCertStore, error)
-
-// certVerifier abstracts x509.Certificate.Verify, enabling unit tests to
-// control the validated chain without hitting the Windows CryptoAPI.
-type certVerifier func(*x509.Certificate, x509.VerifyOptions) ([][]*x509.Certificate, error)
 
 // CertStore identifies which Windows certificate store to search.
 type CertStore int
@@ -100,82 +58,7 @@ func (cs *CertificateSource) Close() error {
 // For servers that need zero-downtime certificate rotation, use GetCertificateFunc
 // instead of calling GetWin32Cert once at startup.
 func GetWin32Cert(subject string, store CertStore) (*CertificateSource, error) {
-	return getWin32CertWith(subject, store,
-		func(opts certtostore.WinCertStoreOptions) (winCertStore, error) {
-			wcs, err := certtostore.OpenWinCertStoreWithOptions(opts)
-			if err != nil {
-				return nil, err
-			}
-			return &winCertStoreAdapter{wcs}, nil
-		},
-		func(leaf *x509.Certificate, opts x509.VerifyOptions) ([][]*x509.Certificate, error) {
-			return leaf.Verify(opts)
-		},
-	)
-}
-
-// getWin32CertWith is the testable core of GetWin32Cert. It accepts a
-// storeOpener and certVerifier so that unit tests can inject in-memory
-// certificate stores and chains without requiring a real Windows environment.
-func getWin32CertWith(subject string, store CertStore, open storeOpener, verify certVerifier) (*CertificateSource, error) {
-	fromCurrentUser := store == StoreCurrentUser
-	storeName := "LocalMachine"
-	if fromCurrentUser {
-		storeName = "CurrentUser"
-	}
-
-	wcs, err := open(certtostore.WinCertStoreOptions{
-		CurrentUser: fromCurrentUser,
-		StoreFlags:  certtostore.CertStoreReadOnly,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to open %s cert store: %w", storeName, err)
-	}
-
-	leaf, ctx, _, err := wcs.CertByCommonName(subject)
-	if err != nil {
-		wcs.Close()
-		return nil, fmt.Errorf("certificate with subject %q not found in %s: %w", subject, storeName, err)
-	}
-
-	// Validate the certificate: checks expiry, EKU (ServerAuth), and chain integrity.
-	// x509.Verify uses the Windows certificate verification API on Windows, which
-	// resolves and validates the full issuer chain from the system store.
-	chains, err := verify(leaf, x509.VerifyOptions{
-		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	})
-	if err != nil {
-		wcs.Close()
-		return nil, fmt.Errorf("certificate %q in %s failed validation: %w", subject, storeName, err)
-	}
-
-	// Build the DER-encoded chain for tls.Certificate: leaf + any intermediates.
-	// The root CA is excluded — clients are expected to have it in their trust store.
-	chain := chains[0]
-	// Exclude the root CA; for self-signed certs include at least the leaf.
-	rawLen := max(len(chain)-1, 1)
-	rawChain := make([][]byte, rawLen)
-	for i := range rawLen {
-		rawChain[i] = chain[i].Raw
-	}
-
-	// NOTE: wcs and ctx are intentionally kept open. The signer returned by
-	// CertKey holds a reference to the Windows key provider, which requires
-	// both the store handle and the cert context to remain alive for signing
-	// operations. They are released when Close is called on the returned source.
-	signer, err := wcs.CertKey(ctx)
-	if err != nil {
-		wcs.Close()
-		return nil, fmt.Errorf("failed to acquire private key for %q in %s: %w", subject, storeName, err)
-	}
-
-	return &CertificateSource{
-		Certificate: tls.Certificate{
-			Certificate: rawChain,
-			PrivateKey:  signer,
-		},
-		wcs: wcs,
-	}, nil
+	return (&win32CertStoreBackend{}).GetCertificate(subject, store)
 }
 
 // cachedCert pairs a CertificateSource with its parsed leaf expiry so that
@@ -185,24 +68,41 @@ type cachedCert struct {
 	expiry time.Time
 }
 
-// certCloser implements io.Closer and releases the currently-cached certificate
-// source. It is intended to be called on server shutdown, after active
+// certCloser implements io.Closer and releases all certificate sources: the
+// currently-cached one and any that were rotated out during the server's
+// lifetime. It is intended to be called on server shutdown, after active
 // connections have drained (e.g. after http.Server.Shutdown returns).
 type certCloser struct {
-	cached *atomic.Pointer[cachedCert]
+	cached  *atomic.Pointer[cachedCert]
+	mu      *sync.Mutex
+	retired *[]*CertificateSource
+	wg      *sync.WaitGroup
 }
 
 func (c *certCloser) Close() error {
-	if cc := c.cached.Load(); cc != nil {
-		return cc.source.Close()
-	}
-	return nil
-}
+	// Block until all in-flight background refresh goroutines have finished.
+	// Without this, a goroutine that completes its fetch after Close returns
+	// would store a new CertificateSource into cached via cached.Swap, and
+	// that source would never be closed, leaking the Windows store handle.
+	c.wg.Wait()
 
-// certFetcher is the signature of the function used to retrieve a certificate
-// from a store. The indirection allows unit tests to supply in-memory
-// certificates without requiring a real Windows certificate store.
-type certFetcher func(subject string, store CertStore) (*CertificateSource, error)
+	c.mu.Lock()
+	retired := *c.retired
+	c.mu.Unlock()
+
+	var errs []error
+	for _, old := range retired {
+		if err := old.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if cc := c.cached.Load(); cc != nil {
+		if err := cc.source.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
 
 // GetCertificateFunc fetches the named certificate from the Windows store
 // immediately at call time, returning an error if that initial fetch fails so
@@ -231,16 +131,16 @@ type certFetcher func(subject string, store CertStore) (*CertificateSource, erro
 // the refresh-pending path perform only atomic loads — no mutex is ever held
 // on the request path.
 func GetCertificateFunc(subject string, store CertStore, refreshThreshold, retryInterval time.Duration) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
-	return newCertificateFunc(subject, store, refreshThreshold, retryInterval, GetWin32Cert)
+	return newCertificateFunc(subject, store, refreshThreshold, retryInterval, &win32CertStoreBackend{})
 }
 
 // newCertificateFunc is the testable core of GetCertificateFunc. It accepts a
-// certFetcher so that unit tests can inject in-memory certificates.
-func newCertificateFunc(subject string, store CertStore, refreshThreshold, retryInterval time.Duration, fetch certFetcher) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
+// certStoreBackend so that unit tests can inject in-memory certificates.
+func newCertificateFunc(subject string, store CertStore, refreshThreshold, retryInterval time.Duration, backend certStoreBackend) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
 	// Eagerly fetch the certificate now so that configuration errors (wrong
 	// subject, missing cert, validation failure) are surfaced at startup rather
 	// than on the first TLS handshake.
-	initial, err := fetch(subject, store)
+	initial, err := backend.GetCertificate(subject, store)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -253,14 +153,13 @@ func newCertificateFunc(subject string, store CertStore, refreshThreshold, retry
 	var (
 		cached      atomic.Pointer[cachedCert]
 		lastAttempt atomic.Int64 // Unix nanoseconds of the last refresh attempt; 0 = never attempted
+		retiredMu   sync.Mutex
+		retired     []*CertificateSource
+		refreshWg   sync.WaitGroup
 	)
 	cached.Store(&cachedCert{source: initial, expiry: leaf.NotAfter})
 
 	getCert := func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
-
-		i, _ := fetch(subject, store)
-		_, _ = x509.ParseCertificate(i.Certificate.Certificate[0])
-
 		c := cached.Load()
 
 		// Hot path: cert is fresh — return immediately without any synchronisation.
@@ -275,8 +174,10 @@ func newCertificateFunc(subject string, store CertStore, refreshThreshold, retry
 		now := time.Now().UnixNano()
 		last := lastAttempt.Load()
 		if now-last >= retryInterval.Nanoseconds() && lastAttempt.CompareAndSwap(last, now) {
+			refreshWg.Add(1)
 			go func() {
-				fresh, err := fetch(subject, store)
+				defer refreshWg.Done()
+				fresh, err := backend.GetCertificate(subject, store)
 				if err != nil {
 					// Keep serving the cached cert; the next interval will retry.
 					return
@@ -291,13 +192,15 @@ func newCertificateFunc(subject string, store CertStore, refreshThreshold, retry
 					return
 				}
 
-				// Atomically publish the new cert and expiry as a single unit so
-				// that readers on the hot path never observe a mismatched pair.
-				// The previous source is not explicitly closed here because ongoing
-				// TLS sessions may still hold a reference to its private key signer;
-				// the Windows store handles will be released by the GC once the old
-				// signer is no longer reachable.
-				cached.Store(&cachedCert{source: fresh, expiry: freshLeaf.NotAfter})
+				// Atomically publish the new cert. Swap captures the old source so
+				// it can be released on shutdown once all connections have drained.
+				// We do not close it here because in-flight TLS sessions may still
+				// hold a reference to its private key signer.
+				if old := cached.Swap(&cachedCert{source: fresh, expiry: freshLeaf.NotAfter}); old != nil {
+					retiredMu.Lock()
+					retired = append(retired, old.source)
+					retiredMu.Unlock()
+				}
 			}()
 		}
 
@@ -308,5 +211,5 @@ func newCertificateFunc(subject string, store CertStore, refreshThreshold, retry
 		return nil, fmt.Errorf("cert: no certificate available for %q", subject)
 	}
 
-	return getCert, &certCloser{cached: &cached}, nil
+	return getCert, &certCloser{cached: &cached, mu: &retiredMu, retired: &retired, wg: &refreshWg}, nil
 }

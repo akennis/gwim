@@ -38,8 +38,8 @@ type Session struct {
 }
 
 var (
-	sessionStore    = cache.New(sessionTTL, 2*sessionTTL)
-	sessionTTL      = 15 * time.Minute
+	sessionStore = cache.New(sessionTTL, 2*sessionTTL)
+	sessionTTL   = 15 * time.Minute
 )
 
 const sessionCookieName = "sec-win-server-session"
@@ -261,6 +261,7 @@ func runServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM bool
 		if err := certCloser.Close(); err != nil {
 			log.Printf("Failed to close certificate store: %v", err)
 		}
+		log.Printf("Certificate store closed.")
 	}()
 
 	// Configure HTTPS server.
@@ -277,23 +278,52 @@ func runServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM bool
 		gwim.ConfigureNTLM(srv)
 	}
 
-	// Graceful shutdown: wait for SIGINT or SIGTERM, then drain connections.
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	// --- Graceful Shutdown ---
+	// Create a context that is canceled on receiving an interrupt signal.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Run the server in a goroutine so that it doesn't block the shutdown handling.
+	serverErrors := make(chan error, 1)
 	go func() {
-		<-quit
-		log.Println("Shutting down server...")
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
-			log.Printf("Server shutdown error: %v", err)
-		}
+		log.Printf("Starting secure server on https://%s", srv.Addr)
+		//ListenAndServeTLS always returns a non-nil error.
+		serverErrors <- srv.ListenAndServeTLS("", "")
 	}()
 
-	log.Printf("Starting secure server on https://%s", srv.Addr)
-	if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-		return err
+	// Wait for a shutdown signal or a server error.
+	select {
+	case err := <-serverErrors:
+		// The server failed to start or crashed.
+		// The deferred certCloser.Close() will run when we return.
+		return fmt.Errorf("server error: %w", err)
+	case <-ctx.Done():
+		// A shutdown signal was received.
+		log.Println("Shutting down server...")
+
+		// Give the server a deadline to gracefully close connections.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		var shutdownErr error
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Server shutdown error: %v", err)
+			shutdownErr = fmt.Errorf("server shutdown: %w", err)
+		}
+
+		// Wait for the ListenAndServeTLS goroutine to exit.
+		if shutdownRes := <-serverErrors; shutdownRes != http.ErrServerClosed {
+			log.Printf("Server shutdown error: %v", shutdownRes)
+			if shutdownErr == nil {
+				shutdownErr = fmt.Errorf("server shutdown: %w", shutdownRes)
+			}
+		} else {
+			log.Println("Server has shut down gracefully.")
+		}
+
+		return shutdownErr
 	}
+
 	return nil
 }
 

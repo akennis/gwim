@@ -154,6 +154,24 @@ func GetCertificateFunc(certSubject string, store CertStore, refreshThreshold, r
 	return icert.GetCertificateFunc(certSubject, store, refreshThreshold, retryInterval)
 }
 
+// CertificateSource holds a TLS certificate retrieved from the Windows store.
+// Call Close when the certificate is no longer needed (e.g. on server shutdown).
+type CertificateSource = icert.CertificateSource
+
+// GetWin32Cert retrieves a certificate from the Windows certificate store by
+// Common Name and returns a CertificateSource. The certificate is validated
+// before being returned: it must not be expired and must carry the
+// ExtKeyUsageServerAuth extended key usage.
+//
+// The caller must call Close on the returned CertificateSource when it is no
+// longer needed to release Windows store handles.
+//
+// For servers that need zero-downtime certificate rotation, use
+// GetCertificateFunc instead.
+func GetWin32Cert(subject string, store CertStore) (*CertificateSource, error) {
+	return icert.GetWin32Cert(subject, store)
+}
+
 // --- Server configuration ---
 
 // ConfigureNTLM sets the ConnContext on server so that each connection is

@@ -45,50 +45,46 @@ func runMinServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM b
 	log.Println("AUTHN/Z: Configuring middleware chain...")
 
 	// LDAP Group Provider (Optional): Enriches context with group info.
-	// if ldapAddress != "" {
-	// 	handler = gwim.NewLdapGroupProvider(handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN, gwim.AuthErrorHandlers{
-	// 		OnGeneralError: onMinAuthError,
-	// 	})
-	// 	log.Println("AUTHN/Z: --> Applied LDAP group provider")
-	// }
+	if ldapAddress != "" {
+		handler = gwim.NewLdapGroupProvider(handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN, gwim.AuthErrorHandlers{
+			OnGeneralError: onMinAuthError,
+		})
+		log.Println("AUTHN/Z: --> Applied LDAP group provider")
+	}
 
-	// // SSPI Handler: Performs Windows Authentication (Kerberos/NTLM).
-	// // This is the core of the gwim API.
-	// handler, err := gwim.NewSSPIHandler(handler, useNTLM, gwim.AuthErrorHandlers{
-	// 	OnGeneralError: onMinAuthError,
-	// })
-	// if err != nil {
-	// 	return fmt.Errorf("failed to create SSPI handler: %w", err)
-	// }
-	// log.Println("AUTHN/Z: --> Applied SSPI handler (Kerberos/NTLM)")
+	// SSPI Handler: Performs Windows Authentication (Kerberos/NTLM).
+	// This is the core of the gwim API.
+	handler, err := gwim.NewSSPIHandler(handler, useNTLM, gwim.AuthErrorHandlers{
+		OnGeneralError: onMinAuthError,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create SSPI handler: %w", err)
+	}
+	log.Println("AUTHN/Z: --> Applied SSPI handler (Kerberos/NTLM)")
 
+	// GetWin32Cert fetches the cert from the Windows store once at startup so
+	// that any configuration error (wrong subject, expired cert, etc.) is caught
+	// here rather than on the first TLS handshake.
+	// Notes:
+	// 1. resource cleanup not performed explicitly - cleaned by OS on proc exit
+	// see examples/sec-win-server.go for explicit server shutdown and resource cleanup
+	// 2. for zero downtime certificate rotation use gwim.GetCertificateFunc
+	// see examples/sec-win-server.go for a usage reference
 	certStore := gwim.CertStoreLocalMachine
 	if certFromCurrentUser {
 		certStore = gwim.CertStoreCurrentUser
 	}
-
-	// GetCertificateFunc fetches the cert from the Windows store immediately so
-	// that any configuration error (wrong subject, expired cert, etc.) is caught
-	// here at startup rather than on the first TLS handshake. The returned
-	// callback caches the cert and automatically refreshes it in the background
-	// within the refresh window before expiry.
-	// The closer releases Windows store handles after all connections have drained.
-	getCertificate, certCloser, err := gwim.GetCertificateFunc(certSubject, certStore, gwim.DefaultRefreshThreshold, gwim.DefaultRetryInterval)
+	certSource, err := gwim.GetWin32Cert(certSubject, certStore)
 	if err != nil {
 		return fmt.Errorf("failed to load TLS certificate %q: %w", certSubject, err)
 	}
-	defer func() {
-		if err := certCloser.Close(); err != nil {
-			log.Printf("Failed to close certificate store: %v", err)
-		}
-	}()
 
 	srv := &http.Server{
 		Addr:    serverAddr,
 		Handler: handler,
 		TLSConfig: &tls.Config{
-			GetCertificate: getCertificate,
-			MinVersion:     tls.VersionTLS13,
+			Certificates: []tls.Certificate{certSource.Certificate},
+			MinVersion:   tls.VersionTLS13,
 		},
 	}
 
@@ -171,28 +167,27 @@ func minRootHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	w.Write([]byte("Hello world"))
 
-	// // gwim.User retrieves the authenticated username from the request context.
-	// username, ok := gwim.User(r)
-	// if !ok {
-	// 	log.Printf("AUTHN/Z: [%s] Unauthorized access to root handler.", r.RemoteAddr)
-	// 	http.Error(w, "Unauthorized", http.StatusUnauthorized)
-	// 	return
-	// }
+	// gwim.User retrieves the authenticated username from the request context.
+	username, ok := gwim.User(r)
+	if !ok {
+		log.Printf("AUTHN/Z: [%s] Unauthorized access to root handler.", r.RemoteAddr)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 
-	// // gwim.UserGroups retrieves group memberships if the LDAP provider is active.
-	// groups, _ := gwim.UserGroups(r)
-	// log.Printf("AUTHN/Z: [%s] Root handler reached for user '%s'", r.RemoteAddr, username)
+	// gwim.UserGroups retrieves group memberships if the LDAP provider is active.
+	groups, _ := gwim.UserGroups(r)
+	log.Printf("AUTHN/Z: [%s] Root handler reached for user '%s'", r.RemoteAddr, username)
 
-	// w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// data := minRootData{
-	// 	Username: username,
-	// 	Groups:   groups,
-	// }
-	// err := minRootTemplate.Execute(w, data)
-	// if err != nil {
-	// 	log.Printf("ERROR: failed to execute root handler template: %v", err)
-	// 	http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-	// }
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	data := minRootData{
+		Username: username,
+		Groups:   groups,
+	}
+	err := minRootTemplate.Execute(w, data)
+	if err != nil {
+		log.Printf("ERROR: failed to execute root handler template: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	}
 }
