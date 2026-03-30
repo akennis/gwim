@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"flag"
+	"fmt"
 	"html/template"
 	"log"
 	"net/http"
@@ -198,7 +199,13 @@ func main() {
 	ldapServiceAccountSPN := flag.String("ldap-service-account-spn", "", "The SPN for the service account in the LDAP server")
 	flag.Parse()
 
-	if *ldapAddress == "" || *ldapUsersDN == "" || *ldapServiceAccountSPN == "" {
+	if err := runServer(*serverAddr, *certSubject, *certFromCurrentUser, *useNTLM, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM bool, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string) error {
+	if ldapAddress == "" || ldapUsersDN == "" || ldapServiceAccountSPN == "" {
 		log.Println("Warning: LDAP flags not set, group provider will be disabled.")
 	}
 
@@ -215,19 +222,19 @@ func main() {
 	log.Println("AUTHN/Z: --> Applied post-auth session middleware (runs last)")
 
 	// LDAP Group Provider: Enriches context with group info (runs after auth).
-	if *ldapAddress != "" {
-		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN, gwim.AuthErrorHandlers{
+	if ldapAddress != "" {
+		handler = gwim.NewLdapGroupProvider(handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN, gwim.AuthErrorHandlers{
 			OnGeneralError: onSecAuthError,
 		})
 		log.Println("AUTHN/Z: --> Applied LDAP group provider")
 	}
 
 	// SSPI Handler: Performs Kerberos/NTLM auth if no user is in the context.
-	handler, err := gwim.NewSSPIHandler(handler, *useNTLM, gwim.AuthErrorHandlers{
+	handler, err := gwim.NewSSPIHandler(handler, useNTLM, gwim.AuthErrorHandlers{
 		OnGeneralError: onSecAuthError,
 	})
 	if err != nil {
-		log.Fatalf("Failed to create SSPI handler: %v", err)
+		return fmt.Errorf("failed to create SSPI handler: %w", err)
 	}
 	log.Println("AUTHN/Z: --> Applied SSPI handler (Kerberos/NTLM)")
 
@@ -236,7 +243,7 @@ func main() {
 	log.Println("AUTHN/Z: --> Applied session middleware (runs first)")
 
 	certStore := gwim.CertStoreLocalMachine
-	if *certFromCurrentUser {
+	if certFromCurrentUser {
 		certStore = gwim.CertStoreCurrentUser
 	}
 
@@ -246,14 +253,19 @@ func main() {
 	// callback caches the cert and automatically refreshes it in the background
 	// within the refresh window before expiry.
 	// The closer releases Windows store handles after all connections have drained.
-	getCertificate, certCloser, err := gwim.GetCertificateFunc(*certSubject, certStore, gwim.DefaultRefreshThreshold)
+	getCertificate, certCloser, err := gwim.GetCertificateFunc(certSubject, certStore, gwim.DefaultRefreshThreshold, gwim.DefaultRetryInterval)
 	if err != nil {
-		log.Fatalf("Failed to load TLS certificate %q: %v", *certSubject, err)
+		return fmt.Errorf("failed to load TLS certificate %q: %w", certSubject, err)
 	}
+	defer func() {
+		if err := certCloser.Close(); err != nil {
+			log.Printf("Failed to close certificate store: %v", err)
+		}
+	}()
 
 	// Configure HTTPS server.
 	srv := &http.Server{
-		Addr:    *serverAddr,
+		Addr:    serverAddr,
 		Handler: handler,
 		TLSConfig: &tls.Config{
 			GetCertificate: getCertificate,
@@ -261,12 +273,11 @@ func main() {
 		},
 	}
 
-	if *useNTLM {
+	if useNTLM {
 		gwim.ConfigureNTLM(srv)
 	}
 
-	// Graceful shutdown: wait for SIGINT or SIGTERM, drain connections, then
-	// release the certificate store handles.
+	// Graceful shutdown: wait for SIGINT or SIGTERM, then drain connections.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -281,13 +292,9 @@ func main() {
 
 	log.Printf("Starting secure server on https://%s", srv.Addr)
 	if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+		return err
 	}
-
-	// All connections have drained; safe to release cert store handles.
-	if err := certCloser.Close(); err != nil {
-		log.Printf("Failed to close certificate store: %v", err)
-	}
+	return nil
 }
 
 func onSecAuthError(w http.ResponseWriter, r *http.Request, err error) {

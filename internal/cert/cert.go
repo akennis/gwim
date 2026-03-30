@@ -215,23 +215,28 @@ type certFetcher func(subject string, store CertStore) (*CertificateSource, erro
 // triggered. The refresh runs in a separate goroutine so that in-flight
 // requests are never blocked waiting for the store: the cached certificate
 // (stale but still valid) is served until the background fetch completes.
-// Only one refresh goroutine runs at a time; subsequent requests within the
-// same window are served from the cache immediately.
+//
+// retryInterval is the minimum time between refresh attempts. If the store is
+// unavailable (e.g. the certificate has not yet been renewed), requests within
+// the refresh window would otherwise trigger a new goroutine on every call.
+// retryInterval prevents that by rate-limiting attempts: a new goroutine is
+// only launched if at least retryInterval has elapsed since the last attempt.
+// At most one refresh goroutine runs per interval even under concurrent load.
 //
 // The returned io.Closer releases the Windows store handles held by the
 // currently-cached certificate. It should be called after the server has
 // finished draining connections (e.g. after http.Server.Shutdown returns).
 //
 // The callback is safe for concurrent use. Both the hot path (cache hit) and
-// the refresh-pending path perform only atomic pointer loads — no mutex is
-// ever held on the request path.
-func GetCertificateFunc(subject string, store CertStore, refreshThreshold time.Duration) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
-	return newCertificateFunc(subject, store, refreshThreshold, GetWin32Cert)
+// the refresh-pending path perform only atomic loads — no mutex is ever held
+// on the request path.
+func GetCertificateFunc(subject string, store CertStore, refreshThreshold, retryInterval time.Duration) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
+	return newCertificateFunc(subject, store, refreshThreshold, retryInterval, GetWin32Cert)
 }
 
 // newCertificateFunc is the testable core of GetCertificateFunc. It accepts a
 // certFetcher so that unit tests can inject in-memory certificates.
-func newCertificateFunc(subject string, store CertStore, refreshThreshold time.Duration, fetch certFetcher) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
+func newCertificateFunc(subject string, store CertStore, refreshThreshold, retryInterval time.Duration, fetch certFetcher) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
 	// Eagerly fetch the certificate now so that configuration errors (wrong
 	// subject, missing cert, validation failure) are surfaced at startup rather
 	// than on the first TLS handshake.
@@ -246,12 +251,16 @@ func newCertificateFunc(subject string, store CertStore, refreshThreshold time.D
 	}
 
 	var (
-		cached     atomic.Pointer[cachedCert]
-		refreshing atomic.Bool
+		cached      atomic.Pointer[cachedCert]
+		lastAttempt atomic.Int64 // Unix nanoseconds of the last refresh attempt; 0 = never attempted
 	)
 	cached.Store(&cachedCert{source: initial, expiry: leaf.NotAfter})
 
 	getCert := func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+
+		i, _ := fetch(subject, store)
+		_, _ = x509.ParseCertificate(i.Certificate.Certificate[0])
+
 		c := cached.Load()
 
 		// Hot path: cert is fresh — return immediately without any synchronisation.
@@ -259,15 +268,17 @@ func newCertificateFunc(subject string, store CertStore, refreshThreshold time.D
 			return &c.source.Certificate, nil
 		}
 
-		// Within the refresh window: fire a background refresh if one is not
-		// already running, then return the current cert without blocking.
-		if refreshing.CompareAndSwap(false, true) {
+		// Within the refresh window: fire a background refresh if at least
+		// retryInterval has elapsed since the last attempt. The CAS ensures at
+		// most one goroutine is launched per interval even under concurrent load,
+		// so a temporarily unavailable store does not cause a goroutine storm.
+		now := time.Now().UnixNano()
+		last := lastAttempt.Load()
+		if now-last >= retryInterval.Nanoseconds() && lastAttempt.CompareAndSwap(last, now) {
 			go func() {
-				defer refreshing.Store(false)
-
 				fresh, err := fetch(subject, store)
 				if err != nil {
-					// Keep serving the cached cert; the next request will retry.
+					// Keep serving the cached cert; the next interval will retry.
 					return
 				}
 
@@ -275,7 +286,7 @@ func newCertificateFunc(subject string, store CertStore, refreshThreshold time.D
 				// guaranteed valid — GetWin32Cert already called x509.Verify.
 				freshLeaf, err := x509.ParseCertificate(fresh.Certificate.Certificate[0])
 				if err != nil {
-					// Keep serving the cached cert; the next request will retry.
+					// Keep serving the cached cert; the next interval will retry.
 					fresh.Close()
 					return
 				}

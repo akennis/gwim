@@ -7,6 +7,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"html/template"
 	"log"
 	"net/http"
@@ -25,7 +26,13 @@ func main() {
 	ldapServiceAccountSPN := flag.String("ldap-service-account-spn", "", "The SPN for the service account in the LDAP server")
 	flag.Parse()
 
-	if *ldapAddress == "" || *ldapUsersDN == "" || *ldapServiceAccountSPN == "" {
+	if err := runMinServer(*serverAddr, *certSubject, *certFromCurrentUser, *useNTLM, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runMinServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM bool, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string) error {
+	if ldapAddress == "" || ldapUsersDN == "" || ldapServiceAccountSPN == "" {
 		log.Println("Warning: LDAP flags not set, group provider will be disabled.")
 	}
 
@@ -38,25 +45,25 @@ func main() {
 	log.Println("AUTHN/Z: Configuring middleware chain...")
 
 	// LDAP Group Provider (Optional): Enriches context with group info.
-	if *ldapAddress != "" {
-		handler = gwim.NewLdapGroupProvider(handler, *ldapAddress, *ldapUsersDN, *ldapServiceAccountSPN, gwim.AuthErrorHandlers{
-			OnGeneralError: onMinAuthError,
-		})
-		log.Println("AUTHN/Z: --> Applied LDAP group provider")
-	}
+	// if ldapAddress != "" {
+	// 	handler = gwim.NewLdapGroupProvider(handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN, gwim.AuthErrorHandlers{
+	// 		OnGeneralError: onMinAuthError,
+	// 	})
+	// 	log.Println("AUTHN/Z: --> Applied LDAP group provider")
+	// }
 
-	// SSPI Handler: Performs Windows Authentication (Kerberos/NTLM).
-	// This is the core of the gwim API.
-	handler, err := gwim.NewSSPIHandler(handler, *useNTLM, gwim.AuthErrorHandlers{
-		OnGeneralError: onMinAuthError,
-	})
-	if err != nil {
-		log.Fatalf("Failed to create SSPI handler: %v", err)
-	}
-	log.Println("AUTHN/Z: --> Applied SSPI handler (Kerberos/NTLM)")
+	// // SSPI Handler: Performs Windows Authentication (Kerberos/NTLM).
+	// // This is the core of the gwim API.
+	// handler, err := gwim.NewSSPIHandler(handler, useNTLM, gwim.AuthErrorHandlers{
+	// 	OnGeneralError: onMinAuthError,
+	// })
+	// if err != nil {
+	// 	return fmt.Errorf("failed to create SSPI handler: %w", err)
+	// }
+	// log.Println("AUTHN/Z: --> Applied SSPI handler (Kerberos/NTLM)")
 
 	certStore := gwim.CertStoreLocalMachine
-	if *certFromCurrentUser {
+	if certFromCurrentUser {
 		certStore = gwim.CertStoreCurrentUser
 	}
 
@@ -65,13 +72,19 @@ func main() {
 	// here at startup rather than on the first TLS handshake. The returned
 	// callback caches the cert and automatically refreshes it in the background
 	// within the refresh window before expiry.
-	getCertificate, _, err := gwim.GetCertificateFunc(*certSubject, certStore, gwim.DefaultRefreshThreshold)
+	// The closer releases Windows store handles after all connections have drained.
+	getCertificate, certCloser, err := gwim.GetCertificateFunc(certSubject, certStore, gwim.DefaultRefreshThreshold, gwim.DefaultRetryInterval)
 	if err != nil {
-		log.Fatalf("Failed to load TLS certificate %q: %v", *certSubject, err)
+		return fmt.Errorf("failed to load TLS certificate %q: %w", certSubject, err)
 	}
+	defer func() {
+		if err := certCloser.Close(); err != nil {
+			log.Printf("Failed to close certificate store: %v", err)
+		}
+	}()
 
 	srv := &http.Server{
-		Addr:    *serverAddr,
+		Addr:    serverAddr,
 		Handler: handler,
 		TLSConfig: &tls.Config{
 			GetCertificate: getCertificate,
@@ -80,12 +93,15 @@ func main() {
 	}
 
 	// NTLM requires specific connection handling on Windows.
-	if *useNTLM {
+	if useNTLM {
 		gwim.ConfigureNTLM(srv)
 	}
 
 	log.Printf("Starting minimal secure server on https://%s", srv.Addr)
-	log.Fatal(srv.ListenAndServeTLS("", ""))
+	if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
 }
 
 func onMinAuthError(w http.ResponseWriter, r *http.Request, err error) {
@@ -155,27 +171,28 @@ func minRootHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	w.Write([]byte("Hello world"))
 
-	// gwim.User retrieves the authenticated username from the request context.
-	username, ok := gwim.User(r)
-	if !ok {
-		log.Printf("AUTHN/Z: [%s] Unauthorized access to root handler.", r.RemoteAddr)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
+	// // gwim.User retrieves the authenticated username from the request context.
+	// username, ok := gwim.User(r)
+	// if !ok {
+	// 	log.Printf("AUTHN/Z: [%s] Unauthorized access to root handler.", r.RemoteAddr)
+	// 	http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	// 	return
+	// }
 
-	// gwim.UserGroups retrieves group memberships if the LDAP provider is active.
-	groups, _ := gwim.UserGroups(r)
-	log.Printf("AUTHN/Z: [%s] Root handler reached for user '%s'", r.RemoteAddr, username)
+	// // gwim.UserGroups retrieves group memberships if the LDAP provider is active.
+	// groups, _ := gwim.UserGroups(r)
+	// log.Printf("AUTHN/Z: [%s] Root handler reached for user '%s'", r.RemoteAddr, username)
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	data := minRootData{
-		Username: username,
-		Groups:   groups,
-	}
-	err := minRootTemplate.Execute(w, data)
-	if err != nil {
-		log.Printf("ERROR: failed to execute root handler template: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-	}
+	// w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// data := minRootData{
+	// 	Username: username,
+	// 	Groups:   groups,
+	// }
+	// err := minRootTemplate.Execute(w, data)
+	// if err != nil {
+	// 	log.Printf("ERROR: failed to execute root handler template: %v", err)
+	// 	http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	// }
 }

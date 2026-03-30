@@ -388,7 +388,7 @@ func TestNewCertificateFunc_hotPath(t *testing.T) {
 		return cert, nil
 	}
 
-	getCert, _, err := newCertificateFunc("test", StoreLocalMachine, threshold, fetch)
+	getCert, _, err := newCertificateFunc("test", StoreLocalMachine, threshold, 0, fetch)
 	if err != nil {
 		t.Fatalf("newCertificateFunc: %v", err)
 	}
@@ -423,7 +423,7 @@ func TestNewCertificateFunc_zeroThreshold(t *testing.T) {
 		return cert, nil
 	}
 
-	getCert, _, err := newCertificateFunc("test", StoreLocalMachine, 0, fetch)
+	getCert, _, err := newCertificateFunc("test", StoreLocalMachine, 0, 0, fetch)
 	if err != nil {
 		t.Fatalf("newCertificateFunc: %v", err)
 	}
@@ -465,7 +465,7 @@ func TestNewCertificateFunc_refreshWindow(t *testing.T) {
 		return cert2, nil
 	}
 
-	getCert, _, err := newCertificateFunc("test", StoreLocalMachine, threshold, fetch)
+	getCert, _, err := newCertificateFunc("test", StoreLocalMachine, threshold, 0, fetch)
 	if err != nil {
 		t.Fatalf("newCertificateFunc: %v", err)
 	}
@@ -525,7 +525,7 @@ func TestNewCertificateFunc_refreshFails(t *testing.T) {
 		return nil, fmt.Errorf("store unavailable")
 	}
 
-	getCert, _, err := newCertificateFunc("test", StoreLocalMachine, threshold, fetch)
+	getCert, _, err := newCertificateFunc("test", StoreLocalMachine, threshold, 0, fetch)
 	if err != nil {
 		t.Fatalf("newCertificateFunc: %v", err)
 	}
@@ -544,7 +544,6 @@ func TestNewCertificateFunc_refreshFails(t *testing.T) {
 		t.Fatal("background refresh goroutine did not complete in time")
 	}
 
-	// Give the goroutine time to reset the refreshing flag before the next call.
 	time.Sleep(10 * time.Millisecond)
 
 	got2, err := getCert(nil)
@@ -580,7 +579,7 @@ func TestNewCertificateFunc_refreshBadDER(t *testing.T) {
 		return badSource, nil
 	}
 
-	getCert, _, err := newCertificateFunc("test", StoreLocalMachine, threshold, fetch)
+	getCert, _, err := newCertificateFunc("test", StoreLocalMachine, threshold, 0, fetch)
 	if err != nil {
 		t.Fatalf("newCertificateFunc: %v", err)
 	}
@@ -593,7 +592,6 @@ func TestNewCertificateFunc_refreshBadDER(t *testing.T) {
 		t.Fatal("background refresh goroutine did not complete in time")
 	}
 
-	// Give the goroutine time to reset the refreshing flag before the next call.
 	time.Sleep(10 * time.Millisecond)
 
 	got, err := getCert(nil)
@@ -625,7 +623,7 @@ func TestNewCertificateFunc_noDoubleRefresh(t *testing.T) {
 		return cert2, nil
 	}
 
-	getCert, _, err := newCertificateFunc("test", StoreLocalMachine, threshold, fetch)
+	getCert, _, err := newCertificateFunc("test", StoreLocalMachine, threshold, time.Hour, fetch)
 	if err != nil {
 		t.Fatalf("newCertificateFunc: %v", err)
 	}
@@ -659,7 +657,7 @@ func TestNewCertificateFunc_initialFetchError(t *testing.T) {
 	fetch := func(_ string, _ CertStore) (*CertificateSource, error) {
 		return nil, fmt.Errorf("store error")
 	}
-	getCert, closer, err := newCertificateFunc("test", StoreLocalMachine, time.Hour, fetch)
+	getCert, closer, err := newCertificateFunc("test", StoreLocalMachine, time.Hour, 0, fetch)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -683,7 +681,7 @@ func TestNewCertificateFunc_initialParseFails(t *testing.T) {
 	fetch := func(_ string, _ CertStore) (*CertificateSource, error) {
 		return bad, nil
 	}
-	_, _, err := newCertificateFunc("test", StoreLocalMachine, time.Hour, fetch)
+	_, _, err := newCertificateFunc("test", StoreLocalMachine, time.Hour, 0, fetch)
 	if err == nil {
 		t.Fatal("expected error for invalid DER, got nil")
 	}

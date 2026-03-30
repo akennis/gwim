@@ -53,7 +53,7 @@ func TestGetWin32Cert(t *testing.T) {
 // initial-fetch error at call time and returns nil for both the callback and
 // the io.Closer, so callers can abort startup without a nil-pointer risk.
 func TestGetCertificateFunc(t *testing.T) {
-	getCert, closer, err := GetCertificateFunc(absentSubject, StoreLocalMachine, 24*time.Hour)
+	getCert, closer, err := GetCertificateFunc(absentSubject, StoreLocalMachine, 24*time.Hour, 0)
 	if err == nil {
 		if closer != nil {
 			closer.Close()

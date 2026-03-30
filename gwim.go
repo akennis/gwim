@@ -125,6 +125,12 @@ const (
 	// GetCertificateFunc triggers a background refresh. Pass this value to
 	// GetCertificateFunc when you do not need a custom refresh window.
 	DefaultRefreshThreshold = 7 * 24 * time.Hour
+
+	// DefaultRetryInterval is the minimum time between background refresh
+	// attempts. If a refresh fails (e.g. the renewed certificate is not yet in
+	// the store), subsequent requests within the refresh window are served from
+	// the cache without spawning new goroutines until this interval elapses.
+	DefaultRetryInterval = 5 * time.Minute
 )
 
 // GetCertificateFunc fetches the named certificate from the Windows store
@@ -134,11 +140,18 @@ const (
 // it is within refreshThreshold of expiry, enabling zero-downtime rotation.
 // Pass DefaultRefreshThreshold for the standard 7-day window.
 //
+// retryInterval is the minimum time between background refresh attempts. If
+// the store is temporarily unavailable (e.g. the renewed certificate has not
+// been deployed yet), requests that arrive within the refresh window would
+// otherwise each spawn a new goroutine. retryInterval rate-limits that
+// behaviour so that at most one attempt runs per interval.
+// Pass DefaultRetryInterval for the standard 5-minute window.
+//
 // The returned io.Closer releases the Windows store handles for the
 // currently-cached certificate. Call it after http.Server.Shutdown returns
 // to ensure all active connections have already finished.
-func GetCertificateFunc(certSubject string, store CertStore, refreshThreshold time.Duration) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
-	return icert.GetCertificateFunc(certSubject, store, refreshThreshold)
+func GetCertificateFunc(certSubject string, store CertStore, refreshThreshold, retryInterval time.Duration) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error) {
+	return icert.GetCertificateFunc(certSubject, store, refreshThreshold, retryInterval)
 }
 
 // --- Server configuration ---
