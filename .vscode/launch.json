@@ -10,7 +10,7 @@
             "request": "launch",
             "mode": "auto",
             "console": "integratedTerminal",
-            "program": "${workspaceFolder}/examples/quick-start.go",
+            "program": "${workspaceFolder}/examples/quick-start/main.go",
             "args": [
                 "-server-addr",
                 "0.0.0.0:8443",
@@ -25,7 +25,7 @@
             "request": "launch",
             "mode": "auto",
             "console": "integratedTerminal",
-            "program": "${workspaceFolder}/examples/quick-start.go",
+            "program": "${workspaceFolder}/examples/quick-start/main.go",
             "args": [
                 "-server-addr",
                 "localhost:8443",
@@ -40,7 +40,7 @@
             "request": "launch",
             "mode": "auto",
             "console": "integratedTerminal",
-            "program": "${workspaceFolder}/examples/min-win-server.go",
+            "program": "${workspaceFolder}/examples/min-win-server/main.go",
             "args": [
                 "-server-addr",
                 "0.0.0.0:8443",
@@ -61,7 +61,7 @@
             "request": "launch",
             "mode": "auto",
             "console": "integratedTerminal",
-            "program": "${workspaceFolder}/examples/sec-win-server.go",
+            "program": "${workspaceFolder}/examples/sec-win-server/main.go",
             "args": [
                 "-server-addr",
                 "0.0.0.0:8443",
@@ -82,7 +82,7 @@
             "request": "launch",
             "mode": "auto",
             "console": "integratedTerminal",
-            "program": "${workspaceFolder}/examples/min-win-server.go",
+            "program": "${workspaceFolder}/examples/min-win-server/main.go",
             "args": [
                 "-server-addr",
                 "localhost:8443",
