@@ -67,9 +67,9 @@ func runMinServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM b
 	// here rather than on the first TLS handshake.
 	// Notes:
 	// 1. resource cleanup not performed explicitly - cleaned by OS on proc exit
-	// see examples/sec-win-server.go for explicit server shutdown and resource cleanup
+	// see examples/sec-win-server/main.go for explicit server shutdown and resource cleanup
 	// 2. for zero downtime certificate rotation use gwim.GetCertificateFunc
-	// see examples/sec-win-server.go for a usage reference
+	// see examples/sec-win-server/main.go for a usage reference
 	certStore := gwim.CertStoreLocalMachine
 	if certFromCurrentUser {
 		certStore = gwim.CertStoreCurrentUser
