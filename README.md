@@ -1,18 +1,8 @@
 # gwim
 
-`gwim` / Go Windows Integrated Middleware is a Go library that simplifies HTTP server security through native Windows integration, including:
-* authentication middleware via Windows SSPI: Kerberos or NTLM
-* authorization middleware based on LDAP group lookup
-* TLS certificate retrieval from the Windows certificate store
+**Windows-native Kerberos/NTLM authentication and TLS for Go HTTP servers.**
 
-Using this library you can deploy a server application in an Active Directory environment that is secure *and also self-contained* (i.e. a single exe as opposed to a complex IIS / NGINX / Apache deployment).
-
-> [!NOTE]
-> Although authentication supports both Kerberos and NTLM, **Kerberos should be used in production** as it is significantly more secure. NTLM support is included only to facilitate local development where the developer is hitting the server from a browser on the same host (a scenario where only NTLM works).
-
-## License
-
-This project is licensed under the BSD 3-Clause License - see the [LICENSE](LICENSE) file for details.
+Deploying a Go service inside a corporate Active Directory domain normally means standing up IIS or a reverse proxy just to get Windows Integrated Authentication. `gwim` removes that requirement. It wraps any `http.Handler` with Kerberos authentication, enriches the request context with LDAP group memberships, and pulls TLS certificates straight from the Windows certificate store — letting you ship a single self-contained `.exe`.
 
 ## Prerequisites
 
@@ -21,12 +11,10 @@ This project is licensed under the BSD 3-Clause License - see the [LICENSE](LICE
 | Windows OS | All features (library uses Windows SSPI / CryptoAPI) |
 | Active Directory domain membership | Kerberos authentication |
 | A registered SPN for the server host (e.g. `HTTP/myserver.corp.local`) | Kerberos authentication |
-| A certificate imported into the Windows certificate store | `GetCertificate` |
+| A certificate imported into the Windows certificate store | `GetWin32Cert` / `GetCertificateFunc` |
 | LDAP-reachable domain controller + a service account SPN | `NewLdapGroupProvider` |
 
 ## Installation
-
-This package is only supported on Windows. Run inside your Go module (or simply import the package and run `go mod tidy`):
 
 ```bash
 go get github.com/akennis/gwim
@@ -34,7 +22,7 @@ go get github.com/akennis/gwim
 
 ## Quick Start
 
-The snippet below is the smallest possible secure server using `gwim`. It retrieves a TLS certificate from the Windows certificate store, wraps a handler with Kerberos authentication, and starts listening. Note, error handling is omitted for brevity.
+The snippet below is the smallest possible secure server using `gwim`. It retrieves a TLS certificate from the Windows certificate store, wraps a handler with Kerberos authentication, and starts listening. Error handling is omitted for brevity.
 
 ```go
 package main
@@ -58,15 +46,19 @@ func main() {
     handler, _ := gwim.NewSSPIHandler(mux, false)
 
     // Retrieve a TLS certificate from the Windows certificate store
-    cert, _ := gwim.GetCertificate("myserver.corp.local", false)
+    certSource, _ := gwim.GetWin32Cert("myserver.corp.local", gwim.CertStoreLocalMachine)
+    defer certSource.Close()
 
     srv := &http.Server{
         Addr:    ":8443",
         Handler: handler,
         TLSConfig: &tls.Config{
-            Certificates: []tls.Certificate{cert},
+            Certificates: []tls.Certificate{certSource.Certificate},
         },
     }
+
+    // Windows authenticates the current domain user transparently —
+    // no login prompt, no credentials to manage.
     log.Fatal(srv.ListenAndServeTLS("", ""))
 }
 ```
@@ -93,34 +85,44 @@ Your Application Handler
 > [!IMPORTANT]
 > **Middleware must be applied in reverse execution order.** Wrap your router with the LDAP provider first, then wrap the result with the SSPI handler. The LDAP provider depends on the username that the SSPI handler places in the context.
 
-## API
+## Usage Examples
 
-The `gwim` package provides the following functions:
+See the [examples](examples) directory for complete, runnable servers:
+
+- [**Minimal secure server**](examples/min-win-server.go) — TLS + Kerberos/NTLM authentication with optional LDAP group lookup, in under 200 lines.
+- [**Session-enabled secure server**](examples/sec-win-server.go) — adds session management and caching so that authentication and LDAP lookups happen once per session rather than on every request, with graceful shutdown and zero-downtime certificate rotation.
+
+## API
 
 ### Authentication
 
-- `NewSSPIHandler(next http.Handler, useNTLM bool, options ...auth.AuthOptions) (http.Handler, error)` — Creates a Windows native authentication middleware that wraps an existing `http.Handler`. The `useNTLM` boolean selects NTLM or Kerberos. Optional `auth.AuthOptions` allow customizing error handlers. Returns an error if Windows SSPI credentials cannot be acquired (e.g. the `Negotiate` security package is unavailable). After the handler successfully authenticates a user, the username is added into the request context available for use elsewhere in your server application. If the user cannot be authenticated then the provided error handler is invoked (or the default error handler responds to the HTTP request with a 401 Unauthorized response).
+- `NewSSPIHandler(next http.Handler, useNTLM bool, options ...AuthErrorHandlers) (http.Handler, error)` — Creates a Windows native authentication middleware that wraps an existing `http.Handler`. The `useNTLM` boolean selects NTLM or Kerberos. Optional `AuthErrorHandlers` allow customizing error responses. Returns an error if Windows SSPI credentials cannot be acquired (e.g. the `Negotiate` security package is unavailable). On success, the authenticated username is stored in the request context and readable via `gwim.User(r)`. On failure, the appropriate error handler is invoked (default: 401 Unauthorized).
 
-- `ConfigureNTLM(server *http.Server)` — Configures the `http.Server` with the `ConnContext` callback required for NTLM connection tracking. NTLM is connection-oriented — each TCP connection carries its own authentication state. This function assigns a unique ID to every connection so the NTLM handler can track multi-step token exchanges across requests on the same connection. **This call is not needed for Kerberos.**
+> [!NOTE]
+> **Kerberos should be used in production** as it is significantly more secure. NTLM support is included only to facilitate local development where the developer is hitting the server from a browser on the same host (a scenario where Kerberos loopback authentication does not work).
+
+- `ConfigureNTLM(server *http.Server)` — Configures the `http.Server` with the `ConnContext` callback required for NTLM connection tracking. NTLM is connection-oriented — each TCP connection carries its own authentication state. This function assigns a unique ID to every connection so the NTLM handler can correlate the two-step token exchange across requests on the same keep-alive connection. **Only required when using NTLM; not needed for Kerberos.**
 
 ### LDAP Group Authorization
 
-- `NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, options ...auth.AuthOptions) http.Handler` — Returns a middleware that enriches the request context with the authenticated user's LDAP group memberships (transatively).
+- `NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, ldapTimeout time.Duration, options ...AuthErrorHandlers) http.Handler` — Returns a middleware that enriches the request context with the authenticated user's LDAP group memberships (transitively).
 
   | Parameter | Example | Description |
   |---|---|---|
-  | `ldapAddress` | `ldap://dc01.corp.local` | Address of the LDAP / domain controller |
+  | `ldapAddress` | `dc01.corp.local:636` | Host and port of the LDAP / domain controller (LDAPS is always used) |
   | `ldapUsersDN` | `OU=Users,DC=corp,DC=local` | Distinguished Name of the OU containing user accounts |
   | `ldapServiceAccountSPN` | `HTTP/myserver.corp.local` | SPN of the LDAP server |
+  | `ldapTimeout` | `gwim.DefaultLdapTimeout` | Per-operation timeout for every LDAP call; pass `gwim.DefaultLdapTimeout` for the standard 5-second value |
 
 ### Request Context Helpers
 
 - `User(r *http.Request) (string, bool)` — Returns the authenticated username from the request context.
-- `SetUser(r *http.Request, username string) *http.Request` — Injects a username into the request context, allowing an application to manage sessions itself and bypass per-request authentication (if the user is set in the request context when the SSPI authentication handler runs then it exits early and does not perform authentication - useful for session restoration).
+- `SetUser(r *http.Request, username string) *http.Request` — Injects a username into the request context. If a username is already present when the SSPI handler runs, authentication is skipped — use this to restore a session without re-running SSPI.
 - `UserGroups(r *http.Request) ([]string, bool)` — Returns the user's group memberships from the request context.
-- `SetUserGroups(r *http.Request, groups []string) *http.Request` — Injects group memberships into the request context, allowing an application to cache groups itself and bypass the LDAP provider (if the groups are set in the request context when the LDAP provider runs then it exits early and does not perform an LDAP lookup).
+- `SetUserGroups(r *http.Request, groups []string) *http.Request` — Injects group memberships into the request context. If groups are already present when the LDAP provider runs, the LDAP lookup is skipped — use this to restore cached groups from a session.
 
-Use `SetUser` and `SetUserGroups` to restore a previously authenticated identity from a session store, avoiding re-authentication and LDAP lookups on every request:
+Use `SetUser` and `SetUserGroups` together to restore a previously authenticated identity from a session store, avoiding re-authentication and LDAP lookups on every request:
+
 ```go
 // In your session middleware, before the SSPI handler runs:
 if sessionUser, ok := getSession(r); ok {
@@ -128,15 +130,18 @@ if sessionUser, ok := getSession(r); ok {
     r = gwim.SetUserGroups(r, sessionUser.Groups)
 }
 ```
+
 See [sec-win-server.go](examples/sec-win-server.go) for a full working example of this pattern.
 
 ### TLS Certificate
 
-- `GetCertificate(certSubject string, fromCurrentUser bool) (tls.Certificate, error)` — Retrieves a TLS certificate from the Windows certificate store. When `fromCurrentUser` is `true`, the `CurrentUser` store is searched; otherwise `LocalMachine` is used. This certificate should be applied to the `http.Server.TLSConfig.Certificates` field supporting TLS.
+- `GetWin32Cert(certSubject string, store CertStore) (*CertificateSource, error)` — Retrieves a TLS certificate from the Windows certificate store by Common Name. Use `CertStoreLocalMachine` or `CertStoreCurrentUser` for `store`. The returned `CertificateSource.Certificate` is a `tls.Certificate` ready for use in `tls.Config.Certificates`. Call `Close()` on the source when it is no longer needed (e.g. on server shutdown) to release Windows store handles.
 
-### Error Handling (`auth.AuthOptions`)
+- `GetCertificateFunc(certSubject string, store CertStore, refreshThreshold, retryInterval time.Duration) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error)` — Like `GetWin32Cert` but returns a `tls.Config.GetCertificate` callback that transparently refreshes the certificate in the background when it is within `refreshThreshold` of expiry, enabling zero-downtime rotation. Pass `DefaultRefreshThreshold` and `DefaultRetryInterval` for standard values. Call `Close()` on the returned `io.Closer` after `http.Server.Shutdown` returns.
 
-Both `NewSSPIHandler` and `NewLdapGroupProvider` accept a variadic `auth.AuthOptions` struct to customize error responses. Each field is an `AuthErrorHandler func(w http.ResponseWriter, r *http.Request, err error)`:
+### Error Handling (`AuthErrorHandlers`)
+
+Both `NewSSPIHandler` and `NewLdapGroupProvider` accept a variadic `AuthErrorHandlers` struct to customize error responses. Each field is an `AuthErrorHandler func(w http.ResponseWriter, r *http.Request, err error)`:
 
 | Field | Triggered when… |
 |---|---|
@@ -150,16 +155,9 @@ Both `NewSSPIHandler` and `NewLdapGroupProvider` accept a variadic `auth.AuthOpt
 
 If no options are provided, sensible defaults are used (plain-text HTTP error responses).
 
-## Usage Examples
-
-See the [examples](examples) directory for examples of how to use `gwim`:
-* [Minimal secure server via GWIM](examples/min-win-server.go)
-* [Session-enabled secure server via gwim](examples/sec-win-server.go)
-  * this example demonstrates how authentication and authorization results from the provided middleware can be used in conjunction with sessions and caching to produce an efficient and secure server.
-
 ## Integration Testing
 
-The `integration_tests` package contains client / sever tests for both NTLM and Kerberos authentication.
+The `integration_tests` package contains client/server tests for both NTLM and Kerberos authentication.
 
 ### Running NTLM Tests
 
@@ -180,7 +178,7 @@ NTLM tests can be run locally by spawning the test server and the test runner on
 
 ### Running Kerberos Tests
 
-Kerberos tests require the test server and the test runner to be on **separate machines** within the same Active Directory domain. This is because Windows handles local Kerberos authentication (Loopback) differently than remote authentication.
+Kerberos tests require the test server and the test runner to be on **separate machines** within the same Active Directory domain. This is because Windows handles local Kerberos authentication (loopback) differently than remote authentication.
 
 1.  Deploy and run `testserver.exe` on Machine A (the "server").
 2.  Run the tests from Machine B (the "client") pointing to Machine A:
@@ -213,3 +211,7 @@ Kerberos tests require the test server and the test runner to be on **separate m
     go tool covdata textfmt -i=coverage_data -o coverage.out
     go tool cover '-html=coverage.out'
     ```
+
+## License
+
+This project is licensed under the BSD 3-Clause License — see the [LICENSE](LICENSE) file for details.

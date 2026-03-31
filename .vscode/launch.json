@@ -5,6 +5,36 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "machine quick-start",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "console": "integratedTerminal",
+            "program": "${workspaceFolder}/examples/quick-start.go",
+            "args": [
+                "-server-addr",
+                "0.0.0.0:8443",
+                "-cert-subject",
+                "${input:cert-subject}",
+                "-use-ntlm=false",
+            ]
+        },
+        {
+            "name": "localhost quick-start",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "console": "integratedTerminal",
+            "program": "${workspaceFolder}/examples/quick-start.go",
+            "args": [
+                "-server-addr",
+                "localhost:8443",
+                "-cert-subject",
+                "${input:cert-subject}",
+                "-use-ntlm=true",
+            ]
+        },
+        {
             "name": "machine min-win-server",
             "type": "go",
             "request": "launch",
@@ -22,8 +52,7 @@
                 "${input:root-ou}",
                 "-ldap-service-account-spn",
                 "${input:ldap-service-account-spn}",
-                "-use-ntlm",
-                "false",
+                "-use-ntlm=false",
             ]
         },
         {
@@ -44,8 +73,7 @@
                 "${input:root-ou}",
                 "-ldap-service-account-spn",
                 "${input:ldap-service-account-spn}",
-                "-use-ntlm",
-                "false",
+                "-use-ntlm=false",
             ]
         },
         {
@@ -66,8 +94,7 @@
                 "${input:root-ou}",
                 "-ldap-service-account-spn",
                 "${input:ldap-service-account-spn}",
-                "-use-ntlm",
-                "true",
+                "-use-ntlm=true",
             ]
         },
         {
@@ -88,8 +115,7 @@
                 "${input:root-ou}",
                 "-ldap-service-account-spn",
                 "${input:ldap-service-account-spn}",
-                "-use-ntlm",
-                "true",
+                "-use-ntlm=true",
             ]
         },
     ],
