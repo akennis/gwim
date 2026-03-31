@@ -238,7 +238,7 @@ func runServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM bool
 
 	// LDAP Group Provider: Enriches context with group info (runs after auth).
 	if ldapAddress != "" {
-		handler = gwim.NewLdapGroupProvider(handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN, gwim.DefaultLdapTimeout, gwim.AuthErrorHandlers{
+		handler = gwim.NewLdapGroupProvider(handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN, gwim.DefaultLdapTimeout, gwim.DefaultLdapTTL, gwim.AuthErrorHandlers{
 			OnGeneralError: onSecAuthError,
 		})
 		log.Println("AUTHN/Z: --> Applied LDAP group provider")

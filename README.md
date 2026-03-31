@@ -105,7 +105,7 @@ See the [examples](examples) directory for complete, runnable servers:
 
 ### LDAP Group Authorization
 
-- `NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, ldapTimeout time.Duration, options ...AuthErrorHandlers) http.Handler` — Returns a middleware that enriches the request context with the authenticated user's LDAP group memberships (transitively).
+- `NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, ldapTimeout, ldapTTL time.Duration, options ...AuthErrorHandlers) http.Handler` — Returns a middleware that enriches the request context with the authenticated user's LDAP group memberships (transitively).
 
   | Parameter | Example | Description |
   |---|---|---|
@@ -113,6 +113,7 @@ See the [examples](examples) directory for complete, runnable servers:
   | `ldapUsersDN` | `OU=Users,DC=corp,DC=local` | Distinguished Name of the OU containing user accounts |
   | `ldapServiceAccountSPN` | `HTTP/myserver.corp.local` | SPN of the LDAP server |
   | `ldapTimeout` | `gwim.DefaultLdapTimeout` | Per-operation timeout for every LDAP call; pass `gwim.DefaultLdapTimeout` for the standard 5-second value |
+  | `ldapTTL` | `gwim.DefaultLdapTTL` | Maximum lifetime of a connection to prevent stale Kerberos tickets; pass `gwim.DefaultLdapTTL` for 1 hour |
 
 ### Request Context Helpers
 

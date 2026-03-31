@@ -104,12 +104,17 @@ func NewSSPIHandler(next http.Handler, useNTLM bool, options ...AuthErrorHandler
 // ldapTimeout is applied to every LDAP operation on each connection (searches,
 // health-check probes, and the initial GSSAPI bind). Zero disables the timeout.
 // Pass DefaultLdapTimeout when you do not need a custom value.
-func NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, ldapTimeout time.Duration, options ...AuthErrorHandlers) http.Handler {
+//
+// ldapTTL is the maximum lifetime of a pooled LDAP connection. This prevents
+// stale Kerberos tickets from causing authentication failures on long-lived connections.
+// Pass DefaultLdapTTL for a standard 1-hour lifetime. Zero disables the TTL.
+func NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, ldapTimeout, ldapTTL time.Duration, options ...AuthErrorHandlers) http.Handler {
 	ldapServerInfo := iauth.LdapServerInfo{
 		Address:           ldapAddress,
 		UsersDN:           ldapUsersDN,
 		ServiceAccountSPN: ldapServiceAccountSPN,
 		Timeout:           ldapTimeout,
+		ConnectionTTL:     ldapTTL,
 	}
 	return iauth.LdapGroupProvider(ldapServerInfo, options...)(next)
 }
@@ -144,6 +149,12 @@ const (
 	// Pass this value to NewLdapGroupProvider when you do not need a custom
 	// timeout.
 	DefaultLdapTimeout = 5 * time.Second
+
+	// DefaultLdapTTL is the default maximum lifetime for a pooled LDAP connection.
+	// In Active Directory, Kerberos tickets typically expire after 10 hours.
+	// Rotating connections every 1 hour ensures they never encounter an expired ticket.
+	// Pass this value to NewLdapGroupProvider when you do not need a custom TTL.
+	DefaultLdapTTL = 1 * time.Hour
 )
 
 // GetCertificateFunc fetches the named certificate from the Windows store
