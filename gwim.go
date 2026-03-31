@@ -100,11 +100,16 @@ func NewSSPIHandler(next http.Handler, useNTLM bool, options ...AuthErrorHandler
 // NewLdapGroupProvider returns an http.Handler that looks up the authenticated
 // user's Active Directory group memberships via LDAP and stores them in the
 // request context, then delegates to next.
-func NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, options ...AuthErrorHandlers) http.Handler {
+//
+// ldapTimeout is applied to every LDAP operation on each connection (searches,
+// health-check probes, and the initial GSSAPI bind). Zero disables the timeout.
+// Pass DefaultLdapTimeout when you do not need a custom value.
+func NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, ldapTimeout time.Duration, options ...AuthErrorHandlers) http.Handler {
 	ldapServerInfo := iauth.LdapServerInfo{
 		Address:           ldapAddress,
 		UsersDN:           ldapUsersDN,
 		ServiceAccountSPN: ldapServiceAccountSPN,
+		Timeout:           ldapTimeout,
 	}
 	return iauth.LdapGroupProvider(ldapServerInfo, options...)(next)
 }
@@ -131,6 +136,14 @@ const (
 	// the store), subsequent requests within the refresh window are served from
 	// the cache without spawning new goroutines until this interval elapses.
 	DefaultRetryInterval = 5 * time.Minute
+
+	// DefaultLdapTimeout is the per-operation timeout applied to every LDAP
+	// call (searches, health-check probes, etc.). In a corporate Active
+	// Directory environment LDAP round-trips are typically sub-100 ms; five
+	// seconds is generous while still failing fast against a hung server.
+	// Pass this value to NewLdapGroupProvider when you do not need a custom
+	// timeout.
+	DefaultLdapTimeout = 5 * time.Second
 )
 
 // GetCertificateFunc fetches the named certificate from the Windows store

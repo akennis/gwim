@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/alexbrainman/sspi/kerberos"
 	"github.com/go-ldap/ldap/v3"
@@ -23,6 +24,9 @@ type LdapServerInfo struct {
 	Address           string
 	UsersDN           string
 	ServiceAccountSPN string
+	// Timeout is the per-operation timeout applied to every LDAP call on the
+	// connection (searches, health-check probes, etc.). Zero means no timeout.
+	Timeout time.Duration
 }
 
 // ldapClient defines the subset of ldap.Conn methods used by this package,
@@ -66,6 +70,9 @@ func connect(l LdapServerInfo) (ldapClient, error) {
 	conn, err := ldap.DialURL(ldapURL, ldap.DialWithTLSConfig(tlsConfig))
 	if err != nil {
 		return nil, err
+	}
+	if l.Timeout > 0 {
+		conn.SetTimeout(l.Timeout)
 	}
 
 	cred, err := kerberos.AcquireCurrentUserCredentials()

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/go-ldap/ldap/v3"
 )
@@ -206,9 +207,12 @@ func TestGetUserGroups(t *testing.T) {
 }
 
 func TestLdapGroupProvider(t *testing.T) {
+	const wantTimeout = 5 * time.Second
+
 	serverInfo := LdapServerInfo{
 		Address: "ldap.example.com:636",
 		UsersDN: "OU=Users,DC=example,DC=com",
+		Timeout: wantTimeout,
 	}
 
 	originalConnector := currentLdapConnector
@@ -231,6 +235,9 @@ func TestLdapGroupProvider(t *testing.T) {
 		}
 
 		currentLdapConnector = func(l LdapServerInfo) (ldapClient, error) {
+			if l.Timeout != wantTimeout {
+				t.Errorf("connector received Timeout = %v, want %v", l.Timeout, wantTimeout)
+			}
 			return m, nil
 		}
 
