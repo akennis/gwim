@@ -38,8 +38,8 @@ type Session struct {
 }
 
 var (
-	sessionStore = cache.New(sessionTTL, 2*sessionTTL)
 	sessionTTL   = 15 * time.Minute
+	sessionStore = cache.New(sessionTTL, 2*sessionTTL)
 )
 
 const sessionCookieName = "sec-win-server-session"
@@ -77,7 +77,7 @@ func regenerateSession(w http.ResponseWriter, r *http.Request, username string) 
 	sessionID := newSession(username)
 
 	// Set the new session cookie.
-	http.SetCookie(w, &http.Cookie{
+	newCookie := &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    sessionID,
 		Path:     "/",
@@ -85,10 +85,25 @@ func regenerateSession(w http.ResponseWriter, r *http.Request, username string) 
 		HttpOnly: true,
 		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
-	})
+	}
+	http.SetCookie(w, newCookie)
 
-	// Update the request's cookie jar so subsequent middleware sees the new session.
-	r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionID})
+	// Replace the cookie on the request so subsequent middleware sees the new session.
+	// This is necessary because r.AddCookie appends, and r.Cookie may return the old
+	// stale cookie if it appears first in the header.
+	var cookies []*http.Cookie
+	for _, c := range r.Cookies() {
+		if c.Name != sessionCookieName {
+			cookies = append(cookies, c)
+		}
+	}
+	cookies = append(cookies, newCookie)
+
+	// Clear the existing Cookie header and rebuild it.
+	r.Header.Del("Cookie")
+	for _, c := range cookies {
+		r.AddCookie(c)
+	}
 
 	log.Printf("Regenerated session: New session is %s for user %s", sessionID, username)
 	return sessionID
