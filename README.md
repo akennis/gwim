@@ -89,8 +89,8 @@ Your Application Handler
 
 See the [examples](examples) directory for complete, runnable servers:
 
-- [**Minimal secure server**](examples/min-win-server.go) — TLS + Kerberos/NTLM authentication with optional LDAP group lookup, in under 200 lines.
-- [**Session-enabled secure server**](examples/sec-win-server.go) — adds session management and caching so that authentication and LDAP lookups happen once per session rather than on every request, with graceful shutdown and zero-downtime certificate rotation.
+- [**Minimal secure server**](examples/min-win-server/main.go) — TLS + Kerberos/NTLM authentication with optional LDAP group lookup, in under 200 lines.
+- [**Session-enabled secure server**](examples/sec-win-server/main.go) — adds session management and caching so that authentication and LDAP lookups happen once per session rather than on every request, with graceful shutdown and zero-downtime certificate rotation.
 
 ## API
 
@@ -132,7 +132,7 @@ if sessionUser, ok := getSession(r); ok {
 }
 ```
 
-See [sec-win-server.go](examples/sec-win-server.go) for a full working example of this pattern.
+See [sec-win-server/main.go](examples/sec-win-server/main.go) for a full working example of this pattern.
 
 ### TLS Certificate
 
@@ -174,7 +174,7 @@ NTLM tests can be run locally by spawning the test server and the test runner on
     ```
 3.  Run the tests:
     ```powershell
-    go test -v ./integration_tests -server-url http://127.0.0.1:8080 -auth-mode ntlm
+    go test -tags=integration -v ./integration_tests -server-url http://127.0.0.1:8080 -auth-mode ntlm
     ```
 
 ### Running Kerberos Tests
@@ -184,7 +184,7 @@ Kerberos tests require the test server and the test runner to be on **separate m
 1.  Deploy and run `testserver.exe` on Machine A (the "server").
 2.  Run the tests from Machine B (the "client") pointing to Machine A:
     ```powershell
-    go test -v ./integration_tests -server-url http://<machine-a-hostname>:8080 -auth-mode kerberos
+    go test -tags=integration -v ./integration_tests -server-url http://<machine-a-hostname>:8080 -auth-mode kerberos
     ```
 
 ## Code Coverage
