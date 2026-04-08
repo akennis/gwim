@@ -109,6 +109,14 @@ func NewSSPIHandler(next http.Handler, useNTLM bool, options ...AuthErrorHandler
 // stale Kerberos tickets from causing authentication failures on long-lived connections.
 // Pass DefaultLdapTTL for a standard 1-hour lifetime. Zero disables the TTL.
 func NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, ldapTimeout, ldapTTL time.Duration, options ...AuthErrorHandlers) http.Handler {
+	// Enforce a minimum timeout to prevent indefinite hangs against
+	// misbehaving domain controllers. Callers that explicitly pass zero
+	// (documented as "no timeout") still get a generous safety net.
+	const minLdapTimeout = 30 * time.Second
+	if ldapTimeout < minLdapTimeout {
+		ldapTimeout = minLdapTimeout
+	}
+
 	ldapServerInfo := iauth.LdapServerInfo{
 		Address:           ldapAddress,
 		UsersDN:           ldapUsersDN,

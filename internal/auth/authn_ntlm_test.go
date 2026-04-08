@@ -112,6 +112,15 @@ func TestNtlmAuthn(t *testing.T) {
 			expectedUser:   "existinguser",
 		},
 		{
+			name: "EmptyUsernameDoesNotBypass",
+			setupContext: func(r *http.Request) *http.Request {
+				ctx := context.WithValue(r.Context(), ContextKeyUsername, "")
+				return r.WithContext(ctx)
+			},
+			expectedStatus: http.StatusUnauthorized,
+			expectWWWAuth:  true,
+		},
+		{
 			name:           "MissingAuthHeader",
 			authHeader:     "",
 			expectedStatus: http.StatusUnauthorized,
