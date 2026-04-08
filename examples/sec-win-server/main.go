@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -35,6 +36,7 @@ type Session struct {
 	Username     string
 	Groups       []string
 	GroupsExpiry time.Time
+	ClientIP     string // IP address the session was created from; used to reject stolen cookies.
 }
 
 var (
@@ -42,17 +44,28 @@ var (
 	sessionStore = cache.New(sessionTTL, 2*sessionTTL)
 )
 
-const sessionCookieName = "sec-win-server-session"
+const sessionCookieName = "__Host-sec-win-server-session"
 
-// newSession creates a new session for the given username and returns the session ID.
-func newSession(username string) string {
+// clientIP extracts the IP address (without port) from r.RemoteAddr.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// newSession creates a new session for the given username bound to the client's
+// IP address and returns the session ID. Subsequent requests presenting this
+// session cookie from a different IP will be rejected.
+func newSession(username, ip string) string {
 	sessionID := make([]byte, 32)
 	if _, err := rand.Read(sessionID); err != nil {
 		log.Fatalf("failed to generate session ID: %v", err)
 	}
 	id := hex.EncodeToString(sessionID)
-	sessionStore.Set(id, Session{Username: username}, cache.DefaultExpiration)
-	log.Printf("Created session %s for user %s", id, username)
+	sessionStore.Set(id, Session{Username: username, ClientIP: ip}, cache.DefaultExpiration)
+	log.Printf("Created session %s for user %s bound to IP %s", id, username, ip)
 	return id
 }
 
@@ -73,8 +86,8 @@ func regenerateSession(w http.ResponseWriter, r *http.Request, username string) 
 		log.Printf("Regenerating session: Deleted old session %s", oldCookie.Value)
 	}
 
-	// Create a new session.
-	sessionID := newSession(username)
+	// Create a new session bound to the client's IP.
+	sessionID := newSession(username, clientIP(r))
 
 	// Set the new session cookie.
 	newCookie := &http.Cookie{
@@ -84,7 +97,7 @@ func regenerateSession(w http.ResponseWriter, r *http.Request, username string) 
 		Expires:  time.Now().Add(sessionTTL),
 		HttpOnly: true,
 		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 	}
 	http.SetCookie(w, newCookie)
 
@@ -141,6 +154,16 @@ func sessionMiddleware(next http.Handler) http.Handler {
 		if !ok {
 			// Invalid or expired session, clear cookie and proceed to authentication
 			log.Printf("AUTHN/Z: [%s] Invalid or expired session. Proceeding to SSPI authentication.", r.RemoteAddr)
+			http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Path: "/", MaxAge: -1})
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Reject the session if the client IP has changed. This prevents a
+		// stolen cookie from being replayed from a different machine.
+		if reqIP := clientIP(r); session.ClientIP != "" && reqIP != session.ClientIP {
+			log.Printf("AUTHN/Z: [%s] Session IP mismatch for user '%s' (expected %s, got %s). Invalidating session.", r.RemoteAddr, session.Username, session.ClientIP, reqIP)
+			sessionStore.Delete(cookie.Value)
 			http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Path: "/", MaxAge: -1})
 			next.ServeHTTP(w, r)
 			return
@@ -338,8 +361,6 @@ func runServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM bool
 
 		return shutdownErr
 	}
-
-	return nil
 }
 
 func onSecAuthError(w http.ResponseWriter, r *http.Request, err error) {

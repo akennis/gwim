@@ -41,8 +41,8 @@ func KerberosAuthn(serverCreds *sspi.Credentials, options ...AuthErrorHandlers) 
 func kerberosAuthn(serverCreds *sspi.Credentials, kp kerberosProvider, errHndlrs AuthErrorHandlers) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// If the username is already in the context, skip authentication
-			if _, ok := r.Context().Value(ContextKeyUsername).(string); ok {
+			// If a non-empty username is already in the context, skip authentication.
+			if username, ok := r.Context().Value(ContextKeyUsername).(string); ok && username != "" {
 				next.ServeHTTP(w, r)
 				return
 			}
