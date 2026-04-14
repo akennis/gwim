@@ -33,8 +33,8 @@ import (
 type AuthErrorHandler = iauth.AuthErrorHandler
 
 // AuthErrorHandlers configures the error-handling behaviour of the
-// authentication middleware. Pass one as a variadic option to NewSSPIHandler
-// or NewLdapGroupProvider. Any field left nil falls back to the built-in
+// authentication middleware. Pass one to WithSSPIErrorHandlers or
+// WithLDAPErrorHandlers. Any field left nil falls back to the built-in
 // default for that category; set OnGeneralError as a single catch-all.
 type AuthErrorHandlers = iauth.AuthErrorHandlers
 
@@ -75,56 +75,179 @@ func SetUserGroups(r *http.Request, groups []string) *http.Request {
 	return r.WithContext(ctx)
 }
 
-// --- Middleware constructors ---
+// --- SSPI Provider ---
 
-// NewSSPIHandler returns an http.Handler that authenticates each request
-// using Kerberos (useNTLM=false) or NTLM (useNTLM=true) via Windows SSPI,
-// then delegates to next. Pass an AuthErrorHandlers value to customise error
-// responses; any unset fields fall back to sensible defaults.
-func NewSSPIHandler(next http.Handler, useNTLM bool, options ...AuthErrorHandlers) (http.Handler, error) {
+type sspiConfig struct {
+	useNTLM     bool
+	errHandlers AuthErrorHandlers
+}
+
+// SSPIOption configures an SSPIProvider.
+type SSPIOption func(*sspiConfig)
+
+// WithNTLM configures the SSPIProvider to use NTLM instead of Kerberos.
+// Required for non-domain or localhost scenarios.
+func WithNTLM() SSPIOption {
+	return func(c *sspiConfig) {
+		c.useNTLM = true
+	}
+}
+
+// WithSSPIErrorHandlers overrides the default error-handling behaviour of the
+// SSPI middleware. Any field left nil falls back to the built-in default.
+func WithSSPIErrorHandlers(h AuthErrorHandlers) SSPIOption {
+	return func(c *sspiConfig) {
+		c.errHandlers = h
+	}
+}
+
+// SSPIProvider authenticates requests using Windows SSPI (Kerberos or NTLM).
+// Create one with NewSSPIProvider, then register its Middleware method with
+// your router's Use() method or wrap handlers manually.
+type SSPIProvider struct {
+	useNTLM    bool
+	middleware func(http.Handler) http.Handler
+}
+
+// NewSSPIProvider acquires the required Windows SSPI credentials and returns
+// a provider whose Middleware method satisfies func(http.Handler) http.Handler.
+// Credential acquisition happens once here so that any configuration error is
+// surfaced at startup rather than on the first request.
+func NewSSPIProvider(opts ...SSPIOption) (*SSPIProvider, error) {
+	cfg := &sspiConfig{}
+	for _, o := range opts {
+		o(cfg)
+	}
+
 	serverCreds, err := sspi.AcquireCredentials("", "Negotiate", sspi.SECPKG_CRED_INBOUND, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire credentials for SPNEGO: %w", err)
 	}
 
-	var handler http.Handler
-	if useNTLM {
-		handler = iauth.NtlmAuthn(serverCreds, options...)(next)
+	var mw func(http.Handler) http.Handler
+	if cfg.useNTLM {
+		mw = iauth.NtlmAuthn(serverCreds, cfg.errHandlers)
 	} else {
-		handler = iauth.KerberosAuthn(serverCreds, options...)(next)
+		mw = iauth.KerberosAuthn(serverCreds, cfg.errHandlers)
 	}
 
-	return handler, nil
+	return &SSPIProvider{useNTLM: cfg.useNTLM, middleware: mw}, nil
 }
 
-// NewLdapGroupProvider returns an http.Handler that looks up the authenticated
-// user's Active Directory group memberships via LDAP and stores them in the
-// request context, then delegates to next.
+// Middleware satisfies func(http.Handler) http.Handler and can be passed
+// directly to any router's Use() method or used to wrap a handler manually:
 //
-// ldapTimeout is applied to every LDAP operation on each connection (searches,
-// health-check probes, and the initial GSSAPI bind). Zero disables the timeout.
-// Pass DefaultLdapTimeout when you do not need a custom value.
-//
-// ldapTTL is the maximum lifetime of a pooled LDAP connection. This prevents
-// stale Kerberos tickets from causing authentication failures on long-lived connections.
-// Pass DefaultLdapTTL for a standard 1-hour lifetime. Zero disables the TTL.
-func NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, ldapTimeout, ldapTTL time.Duration, options ...AuthErrorHandlers) http.Handler {
+//	router.Use(sspiProvider.Middleware)
+//	handler := sspiProvider.Middleware(myHandler)
+func (p *SSPIProvider) Middleware(next http.Handler) http.Handler {
+	return p.middleware(next)
+}
+
+// --- LDAP Provider ---
+
+type ldapConfig struct {
+	address     string
+	usersDN     string
+	spn         string
+	timeout     time.Duration
+	ttl         time.Duration
+	errHandlers AuthErrorHandlers
+}
+
+// LDAPOption configures an LDAPProvider.
+type LDAPOption func(*ldapConfig)
+
+// WithLDAPAddress sets the address of the LDAP server (host:port).
+func WithLDAPAddress(addr string) LDAPOption {
+	return func(c *ldapConfig) {
+		c.address = addr
+	}
+}
+
+// WithLDAPUsersDN sets the Distinguished Name under which users are searched.
+func WithLDAPUsersDN(dn string) LDAPOption {
+	return func(c *ldapConfig) {
+		c.usersDN = dn
+	}
+}
+
+// WithLDAPServiceAccountSPN sets the Service Principal Name of the account
+// used to bind to the LDAP server via GSSAPI/Kerberos.
+func WithLDAPServiceAccountSPN(spn string) LDAPOption {
+	return func(c *ldapConfig) {
+		c.spn = spn
+	}
+}
+
+// WithLDAPTimeout sets the per-operation timeout applied to every LDAP call
+// on each connection (searches, health-check probes, etc.).
+// Zero is treated as DefaultLdapTimeout.
+func WithLDAPTimeout(d time.Duration) LDAPOption {
+	return func(c *ldapConfig) {
+		c.timeout = d
+	}
+}
+
+// WithLDAPConnectionTTL sets the maximum lifetime of a pooled LDAP connection.
+// This prevents stale Kerberos tickets from causing failures on long-lived
+// connections. Zero disables the TTL.
+func WithLDAPConnectionTTL(d time.Duration) LDAPOption {
+	return func(c *ldapConfig) {
+		c.ttl = d
+	}
+}
+
+// WithLDAPErrorHandlers overrides the default error-handling behaviour of the
+// LDAP middleware. Any field left nil falls back to the built-in default.
+func WithLDAPErrorHandlers(h AuthErrorHandlers) LDAPOption {
+	return func(c *ldapConfig) {
+		c.errHandlers = h
+	}
+}
+
+// LDAPProvider enriches an authenticated request's context with the user's
+// Active Directory group memberships. Create one with NewLDAPProvider, then
+// register its Middleware method with your router or wrap handlers manually.
+// It must be placed after SSPIProvider in the middleware chain.
+type LDAPProvider struct {
+	middleware func(http.Handler) http.Handler
+}
+
+// NewLDAPProvider returns an LDAPProvider configured by the given options.
+// LDAP connections are established lazily per request, so no I/O occurs here.
+func NewLDAPProvider(opts ...LDAPOption) *LDAPProvider {
+	cfg := &ldapConfig{
+		timeout: DefaultLdapTimeout,
+		ttl:     DefaultLdapTTL,
+	}
+	for _, o := range opts {
+		o(cfg)
+	}
+
 	// Enforce a minimum timeout to prevent indefinite hangs against
-	// misbehaving domain controllers. Callers that explicitly pass zero
-	// (documented as "no timeout") still get a generous safety net.
+	// misbehaving domain controllers.
 	const minLdapTimeout = 30 * time.Second
-	if ldapTimeout < minLdapTimeout {
-		ldapTimeout = minLdapTimeout
+	if cfg.timeout < minLdapTimeout {
+		cfg.timeout = minLdapTimeout
 	}
 
 	ldapServerInfo := iauth.LdapServerInfo{
-		Address:           ldapAddress,
-		UsersDN:           ldapUsersDN,
-		ServiceAccountSPN: ldapServiceAccountSPN,
-		Timeout:           ldapTimeout,
-		ConnectionTTL:     ldapTTL,
+		Address:           cfg.address,
+		UsersDN:           cfg.usersDN,
+		ServiceAccountSPN: cfg.spn,
+		Timeout:           cfg.timeout,
+		ConnectionTTL:     cfg.ttl,
 	}
-	return iauth.LdapGroupProvider(ldapServerInfo, options...)(next)
+	return &LDAPProvider{middleware: iauth.LdapGroupProvider(ldapServerInfo, cfg.errHandlers)}
+}
+
+// Middleware satisfies func(http.Handler) http.Handler and can be passed
+// directly to any router's Use() method or used to wrap a handler manually:
+//
+//	router.Use(ldapProvider.Middleware)
+//	handler := ldapProvider.Middleware(myHandler)
+func (p *LDAPProvider) Middleware(next http.Handler) http.Handler {
+	return p.middleware(next)
 }
 
 // --- TLS certificate helpers ---
@@ -154,14 +277,11 @@ const (
 	// call (searches, health-check probes, etc.). In a corporate Active
 	// Directory environment LDAP round-trips are typically sub-100 ms; five
 	// seconds is generous while still failing fast against a hung server.
-	// Pass this value to NewLdapGroupProvider when you do not need a custom
-	// timeout.
 	DefaultLdapTimeout = 5 * time.Second
 
 	// DefaultLdapTTL is the default maximum lifetime for a pooled LDAP connection.
 	// In Active Directory, Kerberos tickets typically expire after 10 hours.
 	// Rotating connections every 1 hour ensures they never encounter an expired ticket.
-	// Pass this value to NewLdapGroupProvider when you do not need a custom TTL.
 	DefaultLdapTTL = 1 * time.Hour
 )
 

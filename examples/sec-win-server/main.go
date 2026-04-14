@@ -261,19 +261,27 @@ func runServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM bool
 
 	// LDAP Group Provider: Enriches context with group info (runs after auth).
 	if ldapAddress != "" {
-		handler = gwim.NewLdapGroupProvider(handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN, gwim.DefaultLdapTimeout, gwim.DefaultLdapTTL, gwim.AuthErrorHandlers{
-			OnGeneralError: onSecAuthError,
-		})
+		ldapProvider := gwim.NewLDAPProvider(
+			gwim.WithLDAPAddress(ldapAddress),
+			gwim.WithLDAPUsersDN(ldapUsersDN),
+			gwim.WithLDAPServiceAccountSPN(ldapServiceAccountSPN),
+			gwim.WithLDAPErrorHandlers(gwim.AuthErrorHandlers{OnGeneralError: onSecAuthError}),
+		)
+		handler = ldapProvider.Middleware(handler)
 		log.Println("AUTHN/Z: --> Applied LDAP group provider")
 	}
 
-	// SSPI Handler: Performs Kerberos/NTLM auth if no user is in the context.
-	handler, err := gwim.NewSSPIHandler(handler, useNTLM, gwim.AuthErrorHandlers{
-		OnGeneralError: onSecAuthError,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create SSPI handler: %w", err)
+	// SSPI Provider: Performs Kerberos/NTLM auth if no user is in the context.
+	var sspiOpts []gwim.SSPIOption
+	if useNTLM {
+		sspiOpts = append(sspiOpts, gwim.WithNTLM())
 	}
+	sspiOpts = append(sspiOpts, gwim.WithSSPIErrorHandlers(gwim.AuthErrorHandlers{OnGeneralError: onSecAuthError}))
+	sspiProvider, err := gwim.NewSSPIProvider(sspiOpts...)
+	if err != nil {
+		return fmt.Errorf("failed to create SSPI provider: %w", err)
+	}
+	handler = sspiProvider.Middleware(handler)
 	log.Println("AUTHN/Z: --> Applied SSPI handler (Kerberos/NTLM)")
 
 	// Session Middleware: The first handler to run. Checks for an existing session.

@@ -35,14 +35,18 @@ func main() {
 		}
 	})
 
-	handler, err := gwim.NewSSPIHandler(mux, *useNTLM)
+	var sspiOpts []gwim.SSPIOption
+	if *useNTLM {
+		sspiOpts = append(sspiOpts, gwim.WithNTLM())
+	}
+	sspiProvider, err := gwim.NewSSPIProvider(sspiOpts...)
 	if err != nil {
-		log.Fatalf("Failed to create SSPI handler: %v", err)
+		log.Fatalf("Failed to create SSPI provider: %v", err)
 	}
 
 	server := &http.Server{
 		Addr:    *addr,
-		Handler: handler,
+		Handler: sspiProvider.Middleware(mux),
 	}
 
 	if *useNTLM {

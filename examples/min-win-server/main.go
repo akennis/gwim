@@ -46,20 +46,28 @@ func runMinServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM b
 
 	// LDAP Group Provider (Optional): Enriches context with group info.
 	if ldapAddress != "" {
-		handler = gwim.NewLdapGroupProvider(handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN, gwim.DefaultLdapTimeout, gwim.DefaultLdapTTL, gwim.AuthErrorHandlers{
-			OnGeneralError: onMinAuthError,
-		})
+		ldapProvider := gwim.NewLDAPProvider(
+			gwim.WithLDAPAddress(ldapAddress),
+			gwim.WithLDAPUsersDN(ldapUsersDN),
+			gwim.WithLDAPServiceAccountSPN(ldapServiceAccountSPN),
+			gwim.WithLDAPErrorHandlers(gwim.AuthErrorHandlers{OnGeneralError: onMinAuthError}),
+		)
+		handler = ldapProvider.Middleware(handler)
 		log.Println("AUTHN/Z: --> Applied LDAP group provider")
 	}
 
-	// SSPI Handler: Performs Windows Authentication (Kerberos/NTLM).
+	// SSPI Provider: Performs Windows Authentication (Kerberos/NTLM).
 	// This is the core of the gwim API.
-	handler, err := gwim.NewSSPIHandler(handler, useNTLM, gwim.AuthErrorHandlers{
-		OnGeneralError: onMinAuthError,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create SSPI handler: %w", err)
+	var sspiOpts []gwim.SSPIOption
+	if useNTLM {
+		sspiOpts = append(sspiOpts, gwim.WithNTLM())
 	}
+	sspiOpts = append(sspiOpts, gwim.WithSSPIErrorHandlers(gwim.AuthErrorHandlers{OnGeneralError: onMinAuthError}))
+	sspiProvider, err := gwim.NewSSPIProvider(sspiOpts...)
+	if err != nil {
+		return fmt.Errorf("failed to create SSPI provider: %w", err)
+	}
+	handler = sspiProvider.Middleware(handler)
 	log.Println("AUTHN/Z: --> Applied SSPI handler (Kerberos/NTLM)")
 
 	// GetWin32Cert fetches the cert from the Windows store once at startup so
