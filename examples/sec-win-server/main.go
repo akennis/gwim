@@ -270,6 +270,7 @@ func runServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM bool
 		if err != nil {
 			return fmt.Errorf("failed to create LDAP provider: %w", err)
 		}
+		defer ldapProvider.Close() //nolint:errcheck
 		handler = ldapProvider.Middleware(handler)
 		log.Println("AUTHN/Z: --> Applied LDAP group provider")
 	}

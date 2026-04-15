@@ -52,6 +52,8 @@ func User(r *http.Request) (string, bool) {
 
 // SetUser injects a username into the request context, normalising it first.
 // Use this to resume a session without re-running SSPI authentication.
+// An empty username is stored as-is; User(r) will return ("", false) for it
+// since empty strings are treated as "no authenticated user."
 func SetUser(r *http.Request, username string) *http.Request {
 	username = iauth.NormalizeUsername(username)
 	ctx := context.WithValue(r.Context(), iauth.ContextKeyUsername, username)
@@ -60,6 +62,8 @@ func SetUser(r *http.Request, username string) *http.Request {
 
 // UserGroups returns the authenticated user's group memberships from the
 // request context. The second return value is false if no groups are present.
+// After the LDAP middleware runs, it returns ([]string{}, true) for users
+// with no group memberships, distinguishing "no groups" from "LDAP didn't run."
 func UserGroups(r *http.Request) ([]string, bool) {
 	groups, ok := r.Context().Value(iauth.ContextKeyUserGroups).([]string)
 	if !ok {
@@ -211,6 +215,14 @@ func WithLDAPErrorHandlers(h AuthErrorHandlers) LDAPOption {
 // It must be placed after SSPIProvider in the middleware chain.
 type LDAPProvider struct {
 	middleware func(http.Handler) http.Handler
+	closer     io.Closer
+}
+
+// Close drains the LDAP connection pool, closing all idle connections.
+// Call this on server shutdown after the HTTP server has stopped accepting
+// new requests.
+func (p *LDAPProvider) Close() error {
+	return p.closer.Close()
 }
 
 // NewLDAPProvider returns an LDAPProvider configured by the given options.
@@ -222,6 +234,16 @@ func NewLDAPProvider(opts ...LDAPOption) (*LDAPProvider, error) {
 	}
 	for _, o := range opts {
 		o(cfg)
+	}
+
+	if cfg.address == "" {
+		return nil, fmt.Errorf("gwim: LDAP address is required (use WithLDAPAddress)")
+	}
+	if cfg.usersDN == "" {
+		return nil, fmt.Errorf("gwim: LDAP users DN is required (use WithLDAPUsersDN)")
+	}
+	if cfg.spn == "" {
+		return nil, fmt.Errorf("gwim: LDAP service account SPN is required (use WithLDAPServiceAccountSPN)")
 	}
 
 	ldapServerInfo := iauth.LdapServerInfo{
@@ -236,7 +258,8 @@ func NewLDAPProvider(opts ...LDAPOption) (*LDAPProvider, error) {
 		return nil, fmt.Errorf("failed to validate LDAP configuration: %w", err)
 	}
 
-	return &LDAPProvider{middleware: iauth.LdapGroupProvider(ldapServerInfo, cfg.errHandlers)}, nil
+	mw, closer := iauth.LdapGroupProvider(ldapServerInfo, cfg.errHandlers)
+	return &LDAPProvider{middleware: mw, closer: closer}, nil
 }
 
 // Middleware satisfies func(http.Handler) http.Handler and can be passed
@@ -330,7 +353,11 @@ func GetWin32Cert(subject string, store CertStore) (*CertificateSource, error) {
 // keep-alive connection. Only required when using NTLM authentication.
 func ConfigureNTLM(server *http.Server) {
 	connID := uint64(0)
+	existing := server.ConnContext
 	server.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
+		if existing != nil {
+			ctx = existing(ctx, c)
+		}
 		return context.WithValue(ctx, iauth.ContextKeyConnID, atomic.AddUint64(&connID, 1))
 	}
 }

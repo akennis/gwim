@@ -176,7 +176,7 @@ func TestNtlmAuthn(t *testing.T) {
 				req = req.WithContext(ctx)
 			}
 			if tt.authHeader != "" {
-				req.Header.Set(AUTHORIZATION, tt.authHeader)
+				req.Header.Set(authorization, tt.authHeader)
 			}
 
 			rr := httptest.NewRecorder()
@@ -190,7 +190,7 @@ func TestNtlmAuthn(t *testing.T) {
 
 				// Step 2
 				rr = httptest.NewRecorder()
-				req.Header.Set(AUTHORIZATION, "NTLM "+base64.StdEncoding.EncodeToString([]byte("token2")))
+				req.Header.Set(authorization, "NTLM "+base64.StdEncoding.EncodeToString([]byte("token2")))
 				handler(nextHandler).ServeHTTP(rr, req)
 			} else {
 				handler(nextHandler).ServeHTTP(rr, req)
@@ -201,8 +201,8 @@ func TestNtlmAuthn(t *testing.T) {
 			}
 
 			if tt.expectWWWAuth {
-				if rr.Header().Get(WWW_AUTH) != NTLM {
-					t.Errorf("Expected %s header %q, got %q", WWW_AUTH, NTLM, rr.Header().Get(WWW_AUTH))
+				if rr.Header().Get(wwwAuthenticate) != ntlmScheme {
+					t.Errorf("Expected %s header %q, got %q", wwwAuthenticate, ntlmScheme, rr.Header().Get(wwwAuthenticate))
 				}
 			}
 		})

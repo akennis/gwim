@@ -2,7 +2,7 @@
 
 **Windows-native Kerberos/NTLM authentication and TLS for Go HTTP servers.**
 
-Deploying a Go service inside a corporate Active Directory domain normally means standing up IIS or a reverse proxy just to get Windows Integrated Authentication. `gwim` removes that requirement. It wraps any `http.Handler` with Kerberos authentication, enriches the request context with LDAP group memberships, and pulls TLS certificates straight from the Windows certificate store — letting you ship a single self-contained `.exe`.
+Deploying a Go service inside a corporate Active Directory domain normally means standing up IIS or a reverse proxy just to get Windows integrated authentication, authorization, and TLS. `gwim` removes that requirement. It wraps any `http.Handler` with Windows-native Kerberos authentication, enriches the request context with LDAP group memberships, and pulls TLS certificates straight from the Windows certificate store — letting you ship a single self-contained web server `.exe` that runs seamlessly in a Windows domain environment. With `gwim`, you can run Go websites securely right where your users are and just how your Windows infrastructure is configured.
 
 ## Prerequisites
 
@@ -83,7 +83,7 @@ Your Application Handler
 ```
 
 > [!IMPORTANT]
-> **Middleware must be applied in reverse execution order.** Wrap your router with the LDAP provider first, then wrap the result with the SSPI provider. The LDAP middleware depends on the username that the SSPI middleware places in the context.
+> **Refer to your server framework's documentation for instructions on how to apply middleware in the correct order.  Some frameworks (such has the standard net/http framework) require middleware to be applied in reverse order (i.e. LDAP applied before SSPI), while other frameworks require middleware to be applied in the order of actual request flow (i.e. SSPI applied before LDAP).**
 
 ## Usage Examples
 
@@ -155,17 +155,24 @@ Configures the `http.Server` with the `ConnContext` callback required for NTLM c
 #### `NewLDAPProvider`
 
 ```go
-ldapProvider := gwim.NewLDAPProvider(opts ...LDAPOption) *LDAPProvider
+ldapProvider, err := gwim.NewLDAPProvider(opts ...LDAPOption) (*LDAPProvider, error)
 ```
 
-Returns a provider that enriches an authenticated request's context with the user's Active Directory group memberships (transitively). LDAP connections are established lazily, so no I/O occurs in this call.
+Returns a provider that enriches an authenticated request's context with the user's Active Directory group memberships (transitively, via the `tokenGroups` attribute). Groups are returned as LDAP Distinguished Names (DNs), e.g. `CN=AppAdmins,OU=Groups,DC=corp,DC=local`.
+
+**Startup validation:** `NewLDAPProvider` performs a synchronous connectivity check before returning. It opens a TLS (LDAPS) connection to the configured address, authenticates via GSSAPI/Kerberos bind using the server's current-user credentials, and executes a RootDSE search. If any step fails, an error is returned here at startup rather than on the first request.
+
+At runtime, the provider maintains an internal connection pool (capacity: 10). On each request a pooled connection is health-checked with a lightweight RootDSE probe before use; connections that fail the probe or exceed their TTL are discarded and a new one is created.
 
 ```go
-ldapProvider := gwim.NewLDAPProvider(
+ldapProvider, err := gwim.NewLDAPProvider(
     gwim.WithLDAPAddress("dc01.corp.local:636"),
     gwim.WithLDAPUsersDN("OU=Users,DC=corp,DC=local"),
     gwim.WithLDAPServiceAccountSPN("HTTP/myserver.corp.local"),
 )
+if err != nil {
+    log.Fatalf("failed to create LDAP provider: %v", err)
+}
 
 // Wrap the SSPI-wrapped handler
 handler = ldapProvider.Middleware(sspiProvider.Middleware(mux))
@@ -202,7 +209,7 @@ e.Use(echo.WrapMiddleware(sspiProvider.Middleware))
 
 - `User(r *http.Request) (string, bool)` — Returns the authenticated username from the request context.
 - `SetUser(r *http.Request, username string) *http.Request` — Injects a username into the request context. If a username is already present when the SSPI middleware runs, authentication is skipped — use this to restore a session without re-running SSPI.
-- `UserGroups(r *http.Request) ([]string, bool)` — Returns the user's group memberships from the request context.
+- `UserGroups(r *http.Request) ([]string, bool)` — Returns the user's group memberships from the request context as LDAP Distinguished Names (DNs), e.g. `CN=AppAdmins,OU=Groups,DC=corp,DC=local`.
 - `SetUserGroups(r *http.Request, groups []string) *http.Request` — Injects group memberships into the request context. If groups are already present when the LDAP middleware runs, the LDAP lookup is skipped — use this to restore cached groups from a session.
 
 Use `SetUser` and `SetUserGroups` together to restore a previously authenticated identity from a session store, avoiding re-authentication and LDAP lookups on every request:
@@ -219,7 +226,7 @@ See [sec-win-server/main.go](examples/sec-win-server/main.go) for a full working
 
 ### TLS Certificate
 
-- `GetWin32Cert(certSubject string, store CertStore) (*CertificateSource, error)` — Retrieves a TLS certificate from the Windows certificate store by Common Name. Use `CertStoreLocalMachine` or `CertStoreCurrentUser` for `store`. The returned `CertificateSource.Certificate` is a `tls.Certificate` ready for use in `tls.Config.Certificates`. Call `Close()` on the source when it is no longer needed (e.g. on server shutdown) to release Windows store handles.
+- `GetWin32Cert(certSubject string, store CertStore) (*CertificateSource, error)` — Retrieves a TLS certificate from the Windows certificate store by Common Name. Use `CertStoreLocalMachine` or `CertStoreCurrentUser` for `store`. The certificate is validated before being returned: it must not be expired, must carry `ExtKeyUsageServerAuth`, and its full issuer chain must pass verification via the Windows CryptoAPI. The returned `CertificateSource.Certificate` is a `tls.Certificate` ready for use in `tls.Config.Certificates`. Call `Close()` on the source when it is no longer needed (e.g. on server shutdown) to release Windows store handles.
 
 - `GetCertificateFunc(certSubject string, store CertStore, refreshThreshold, retryInterval time.Duration) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error)` — Like `GetWin32Cert` but returns a `tls.Config.GetCertificate` callback that transparently refreshes the certificate in the background when it is within `refreshThreshold` of expiry, enabling zero-downtime rotation. Pass `DefaultRefreshThreshold` and `DefaultRetryInterval` for standard values. Call `Close()` on the returned `io.Closer` after `http.Server.Shutdown` returns.
 
@@ -238,6 +245,8 @@ Both `WithSSPIErrorHandlers` and `WithLDAPErrorHandlers` accept an `AuthErrorHan
 | `OnGeneralError` | Catch-all: fills in for any of the above handlers that is not explicitly set |
 
 If no options are provided, sensible defaults are used (plain-text HTTP error responses).
+
+Requests do not progress to the next request hander in the chain once an error has occurred.  The error handler is executed and control is sent back up the request hander chain (i.e. the earlier handlers).
 
 ## Integration Testing
 

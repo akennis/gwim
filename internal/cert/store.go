@@ -47,6 +47,8 @@ func (s *win32CertStore) CertByCommonName(cn string) (*x509.Certificate, any, []
 	cert, ctx, chains, err := s.wcs.CertByCommonName(cn)
 	if err != nil && ctx != nil {
 		certtostore.FreeCertContext(ctx)
+	}
+	if err != nil {
 		return nil, nil, nil, err
 	}
 	s.certCtx = ctx

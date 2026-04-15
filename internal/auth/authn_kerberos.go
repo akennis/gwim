@@ -29,11 +29,7 @@ func (p *defaultKerberosProvider) NewServerContext(creds *sspi.Credentials, clie
 	return kerberos.NewServerContext(creds, clientToken)
 }
 
-func KerberosAuthn(serverCreds *sspi.Credentials, options ...AuthErrorHandlers) func(http.Handler) http.Handler {
-	var opts AuthErrorHandlers
-	if len(options) > 0 {
-		opts = options[0]
-	}
+func KerberosAuthn(serverCreds *sspi.Credentials, opts AuthErrorHandlers) func(http.Handler) http.Handler {
 	opts.ApplyGeneralError()
 	return kerberosAuthn(serverCreds, &defaultKerberosProvider{}, opts)
 }
@@ -47,14 +43,14 @@ func kerberosAuthn(serverCreds *sspi.Credentials, kp kerberosProvider, errHndlrs
 				return
 			}
 
-			authHeader := r.Header.Get(AUTHORIZATION)
-			if !strings.HasPrefix(authHeader, NEGOTIATE_SPC) {
-				w.Header().Set(WWW_AUTH, NEGOTIATE)
+			authHeader := r.Header.Get(authorization)
+			if !strings.HasPrefix(authHeader, negotiateSpc) {
+				w.Header().Set(wwwAuthenticate, negotiate)
 				errHndlrs.GetOnUnauthorized()(w, r, fmt.Errorf("requesting client to negotiate kerberos authentication"))
 				return
 			}
 
-			token64 := authHeader[TOKEN_OFFSET:]
+			token64 := authHeader[tokenOffset:]
 			clientToken, err := base64.StdEncoding.DecodeString(token64)
 			if err != nil {
 				errHndlrs.GetOnInvalidToken()(w, r, err)

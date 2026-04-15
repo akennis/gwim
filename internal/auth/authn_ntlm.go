@@ -20,8 +20,8 @@ import (
 )
 
 const (
-	NTLM     = "NTLM"
-	NTLM_SPC = NTLM + " "
+	ntlmScheme = "NTLM"
+	ntlmSpc    = ntlmScheme + " "
 )
 
 type SecPkgContext_Names struct {
@@ -70,12 +70,8 @@ func getSSPIUsername(sctxt *sspi.CtxtHandle) (string, error) {
 	return syscall.UTF16ToString((*[2 << 20]uint16)(unsafe.Pointer(n.UserName))[:]), nil
 }
 
-func NtlmAuthn(serverCreds *sspi.Credentials, errHndlrs ...AuthErrorHandlers) func(http.Handler) http.Handler {
+func NtlmAuthn(serverCreds *sspi.Credentials, opts AuthErrorHandlers) func(http.Handler) http.Handler {
 	authCache := cache.New(1*time.Minute, 2*time.Minute)
-	var opts AuthErrorHandlers
-	if len(errHndlrs) > 0 {
-		opts = errHndlrs[0]
-	}
 	opts.ApplyGeneralError()
 	return ntlmAuthn(serverCreds, &defaultNtlmProvider{}, authCache, opts)
 }
@@ -152,14 +148,14 @@ func ntlmAuthn(serverCreds *sspi.Credentials, np ntlmProvider, authCache *cache.
 				return
 			}
 
-			authHeader := r.Header.Get(AUTHORIZATION)
+			authHeader := r.Header.Get(authorization)
 			var token64 string
-			if strings.HasPrefix(authHeader, NTLM_SPC) {
-				token64 = authHeader[len(NTLM_SPC):]
+			if strings.HasPrefix(authHeader, ntlmSpc) {
+				token64 = authHeader[len(ntlmSpc):]
 			}
 
 			if token64 == "" {
-				w.Header().Add(WWW_AUTH, NTLM)
+				w.Header().Add(wwwAuthenticate, ntlmScheme)
 				opts.GetOnUnauthorized()(w, r, fmt.Errorf("missing authentication header"))
 				return
 			}
@@ -184,7 +180,7 @@ func ntlmAuthn(serverCreds *sspi.Credentials, np ntlmProvider, authCache *cache.
 			}
 
 			if !authDone {
-				w.Header().Set(WWW_AUTH, NTLM+" "+base64.StdEncoding.EncodeToString(outputToken))
+				w.Header().Set(wwwAuthenticate, ntlmScheme+" "+base64.StdEncoding.EncodeToString(outputToken))
 				opts.GetOnUnauthorized()(w, r, fmt.Errorf("negotiation in progress"))
 				return
 			}
