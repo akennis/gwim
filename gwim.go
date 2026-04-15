@@ -214,21 +214,14 @@ type LDAPProvider struct {
 }
 
 // NewLDAPProvider returns an LDAPProvider configured by the given options.
-// LDAP connections are established lazily per request, so no I/O occurs here.
-func NewLDAPProvider(opts ...LDAPOption) *LDAPProvider {
+// LDAP connections are established lazily per request after initial validation.
+func NewLDAPProvider(opts ...LDAPOption) (*LDAPProvider, error) {
 	cfg := &ldapConfig{
 		timeout: DefaultLdapTimeout,
 		ttl:     DefaultLdapTTL,
 	}
 	for _, o := range opts {
 		o(cfg)
-	}
-
-	// Enforce a minimum timeout to prevent indefinite hangs against
-	// misbehaving domain controllers.
-	const minLdapTimeout = 30 * time.Second
-	if cfg.timeout < minLdapTimeout {
-		cfg.timeout = minLdapTimeout
 	}
 
 	ldapServerInfo := iauth.LdapServerInfo{
@@ -238,7 +231,12 @@ func NewLDAPProvider(opts ...LDAPOption) *LDAPProvider {
 		Timeout:           cfg.timeout,
 		ConnectionTTL:     cfg.ttl,
 	}
-	return &LDAPProvider{middleware: iauth.LdapGroupProvider(ldapServerInfo, cfg.errHandlers)}
+
+	if err := iauth.ValidateLDAP(ldapServerInfo); err != nil {
+		return nil, fmt.Errorf("failed to validate LDAP configuration: %w", err)
+	}
+
+	return &LDAPProvider{middleware: iauth.LdapGroupProvider(ldapServerInfo, cfg.errHandlers)}, nil
 }
 
 // Middleware satisfies func(http.Handler) http.Handler and can be passed

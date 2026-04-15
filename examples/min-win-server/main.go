@@ -46,12 +46,15 @@ func runMinServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM b
 
 	// LDAP Group Provider (Optional): Enriches context with group info.
 	if ldapAddress != "" {
-		ldapProvider := gwim.NewLDAPProvider(
+		ldapProvider, err := gwim.NewLDAPProvider(
 			gwim.WithLDAPAddress(ldapAddress),
 			gwim.WithLDAPUsersDN(ldapUsersDN),
 			gwim.WithLDAPServiceAccountSPN(ldapServiceAccountSPN),
 			gwim.WithLDAPErrorHandlers(gwim.AuthErrorHandlers{OnGeneralError: onMinAuthError}),
 		)
+		if err != nil {
+			return fmt.Errorf("failed to create LDAP provider: %w", err)
+		}
 		handler = ldapProvider.Middleware(handler)
 		log.Println("AUTHN/Z: --> Applied LDAP group provider")
 	}

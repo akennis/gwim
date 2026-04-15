@@ -242,6 +242,30 @@ type pooledLdapClient struct {
 	createdAt time.Time
 }
 
+// ValidateLDAP performs a lightweight connection and search against the LDAP
+// server to verify that the configuration is valid and the server is reachable.
+func ValidateLDAP(l LdapServerInfo) error {
+	client, err := currentLdapConnector(l)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	// Perform a RootDSE search as a lightweight connectivity check.
+	searchRequest := ldap.NewSearchRequest(
+		"", ldap.ScopeBaseObject, ldap.NeverDerefAliases, 1, 0, false,
+		"(objectClass=*)", []string{"dn"}, nil,
+	)
+	sr, err := client.Search(searchRequest)
+	if err != nil {
+		return err
+	}
+	if len(sr.Entries) == 0 {
+		return fmt.Errorf("LDAP validation failed: no entries returned for RootDSE search")
+	}
+	return nil
+}
+
 func LdapGroupProvider(ldapServerInfo LdapServerInfo, errHndlrs ...AuthErrorHandlers) func(http.Handler) http.Handler {
 	ldapPool := make(chan pooledLdapClient, 10)
 	var opts AuthErrorHandlers

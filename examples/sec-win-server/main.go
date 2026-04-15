@@ -261,12 +261,15 @@ func runServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM bool
 
 	// LDAP Group Provider: Enriches context with group info (runs after auth).
 	if ldapAddress != "" {
-		ldapProvider := gwim.NewLDAPProvider(
+		ldapProvider, err := gwim.NewLDAPProvider(
 			gwim.WithLDAPAddress(ldapAddress),
 			gwim.WithLDAPUsersDN(ldapUsersDN),
 			gwim.WithLDAPServiceAccountSPN(ldapServiceAccountSPN),
 			gwim.WithLDAPErrorHandlers(gwim.AuthErrorHandlers{OnGeneralError: onSecAuthError}),
 		)
+		if err != nil {
+			return fmt.Errorf("failed to create LDAP provider: %w", err)
+		}
 		handler = ldapProvider.Middleware(handler)
 		log.Println("AUTHN/Z: --> Applied LDAP group provider")
 	}
