@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,9 +22,21 @@ import (
 	"github.com/go-ldap/ldap/v3"
 )
 
-type closerFunc func() error
+type ldapPool chan pooledLdapClient
 
-func (f closerFunc) Close() error { return f() }
+func (p ldapPool) Close() error {
+	var errs []error
+	for {
+		select {
+		case pc := <-p:
+			if err := pc.client.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		default:
+			return errors.Join(errs...)
+		}
+	}
+}
 
 type LdapServerInfo struct {
 	Address           string
@@ -272,19 +285,8 @@ func ValidateLDAP(l LdapServerInfo) error {
 }
 
 func LdapGroupProvider(ldapServerInfo LdapServerInfo, opts AuthErrorHandlers) (func(http.Handler) http.Handler, io.Closer) {
-	ldapPool := make(chan pooledLdapClient, 10)
+	pool := make(ldapPool, 10)
 	opts.ApplyGeneralError()
-
-	closer := closerFunc(func() error {
-		for {
-			select {
-			case pc := <-ldapPool:
-				pc.client.Close()
-			default:
-				return nil
-			}
-		}
-	})
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -307,7 +309,7 @@ func LdapGroupProvider(ldapServerInfo LdapServerInfo, opts AuthErrorHandlers) (f
 
 			// Try to get a connection from the pool
 			select {
-			case pooledConn := <-ldapPool:
+			case pooledConn := <-pool:
 				ldapServiceConn = pooledConn.client
 				connCreatedAt = pooledConn.createdAt
 
@@ -349,7 +351,7 @@ func LdapGroupProvider(ldapServerInfo LdapServerInfo, opts AuthErrorHandlers) (f
 
 			// Return connection to pool
 			select {
-			case ldapPool <- pooledLdapClient{client: ldapServiceConn, createdAt: connCreatedAt}:
+			case pool <- pooledLdapClient{client: ldapServiceConn, createdAt: connCreatedAt}:
 			default:
 				ldapServiceConn.Close()
 			}
@@ -357,5 +359,5 @@ func LdapGroupProvider(ldapServerInfo LdapServerInfo, opts AuthErrorHandlers) (f
 			ctx := context.WithValue(r.Context(), ContextKeyUserGroups, userGroups)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
-	}, closer
+	}, pool
 }
