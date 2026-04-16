@@ -134,7 +134,7 @@ func TestKerberosAuthn(t *testing.T) {
 				req = tt.setupContext(req)
 			}
 			if tt.authHeader != "" {
-				req.Header.Set(AUTHORIZATION, tt.authHeader)
+				req.Header.Set(authorization, tt.authHeader)
 			}
 
 			rr := httptest.NewRecorder()
@@ -145,8 +145,8 @@ func TestKerberosAuthn(t *testing.T) {
 			}
 
 			if tt.expectWWWAuth {
-				if rr.Header().Get(WWW_AUTH) != NEGOTIATE {
-					t.Errorf("Expected %s header %q, got %q", WWW_AUTH, NEGOTIATE, rr.Header().Get(WWW_AUTH))
+				if rr.Header().Get(wwwAuthenticate) != negotiate {
+					t.Errorf("Expected %s header %q, got %q", wwwAuthenticate, negotiate, rr.Header().Get(wwwAuthenticate))
 				}
 			}
 		})
@@ -188,7 +188,7 @@ func TestKerberosAuthn_CustomHandlers(t *testing.T) {
 
 		handler := kerberosAuthn(nil, nil, optsWithSpecific)
 		req := httptest.NewRequest("GET", "http://example.com/foo", nil)
-		req.Header.Set(AUTHORIZATION, "Negotiate invalid-base64-!!!")
+		req.Header.Set(authorization, "Negotiate invalid-base64-!!!")
 		rr := httptest.NewRecorder()
 
 		handler(nil).ServeHTTP(rr, req)

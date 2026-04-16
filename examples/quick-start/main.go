@@ -26,7 +26,11 @@ func main() {
 		w.Write([]byte("Hello, " + username))
 	})
 
-	handler, err := gwim.NewSSPIHandler(mux, *useNTLM)
+	var sspiOpts []gwim.SSPIOption
+	if *useNTLM {
+		sspiOpts = append(sspiOpts, gwim.WithNTLM())
+	}
+	sspiProvider, err := gwim.NewSSPIProvider(sspiOpts...)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -43,7 +47,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    *serverAddr,
-		Handler: handler,
+		Handler: sspiProvider.Middleware(mux),
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{certSource.Certificate},
 		},

@@ -76,12 +76,14 @@ func (o *AuthErrorHandlers) ApplyGeneralError() {
 	}
 }
 
+var defaultHandlers = DefaultAuthErrorHandlers()
+
 // GetOnUnauthorized returns the OnUnauthorized handler or the default.
 func (o AuthErrorHandlers) GetOnUnauthorized() AuthErrorHandler {
 	if o.OnUnauthorized != nil {
 		return o.OnUnauthorized
 	}
-	return DefaultAuthErrorHandlers().OnUnauthorized
+	return defaultHandlers.OnUnauthorized
 }
 
 // GetOnInvalidToken returns the OnInvalidToken handler or the default.
@@ -89,7 +91,7 @@ func (o AuthErrorHandlers) GetOnInvalidToken() AuthErrorHandler {
 	if o.OnInvalidToken != nil {
 		return o.OnInvalidToken
 	}
-	return DefaultAuthErrorHandlers().OnInvalidToken
+	return defaultHandlers.OnInvalidToken
 }
 
 // GetOnAuthFailed returns the OnAuthFailed handler or the default.
@@ -97,7 +99,7 @@ func (o AuthErrorHandlers) GetOnAuthFailed() AuthErrorHandler {
 	if o.OnAuthFailed != nil {
 		return o.OnAuthFailed
 	}
-	return DefaultAuthErrorHandlers().OnAuthFailed
+	return defaultHandlers.OnAuthFailed
 }
 
 // GetOnIdentityError returns the OnIdentityError handler or the default.
@@ -105,7 +107,7 @@ func (o AuthErrorHandlers) GetOnIdentityError() AuthErrorHandler {
 	if o.OnIdentityError != nil {
 		return o.OnIdentityError
 	}
-	return DefaultAuthErrorHandlers().OnIdentityError
+	return defaultHandlers.OnIdentityError
 }
 
 // GetOnLdapConnectionError returns the OnLdapConnectionError handler or the default.
@@ -113,7 +115,7 @@ func (o AuthErrorHandlers) GetOnLdapConnectionError() AuthErrorHandler {
 	if o.OnLdapConnectionError != nil {
 		return o.OnLdapConnectionError
 	}
-	return DefaultAuthErrorHandlers().OnLdapConnectionError
+	return defaultHandlers.OnLdapConnectionError
 }
 
 // GetOnLdapLookupError returns the OnLdapLookupError handler or the default.
@@ -121,5 +123,5 @@ func (o AuthErrorHandlers) GetOnLdapLookupError() AuthErrorHandler {
 	if o.OnLdapLookupError != nil {
 		return o.OnLdapLookupError
 	}
-	return DefaultAuthErrorHandlers().OnLdapLookupError
+	return defaultHandlers.OnLdapLookupError
 }

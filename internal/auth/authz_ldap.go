@@ -10,7 +10,9 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -19,6 +21,22 @@ import (
 	"github.com/alexbrainman/sspi/kerberos"
 	"github.com/go-ldap/ldap/v3"
 )
+
+type ldapPool chan pooledLdapClient
+
+func (p ldapPool) Close() error {
+	var errs []error
+	for {
+		select {
+		case pc := <-p:
+			if err := pc.client.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		default:
+			return errors.Join(errs...)
+		}
+	}
+}
 
 type LdapServerInfo struct {
 	Address           string
@@ -242,12 +260,32 @@ type pooledLdapClient struct {
 	createdAt time.Time
 }
 
-func LdapGroupProvider(ldapServerInfo LdapServerInfo, errHndlrs ...AuthErrorHandlers) func(http.Handler) http.Handler {
-	ldapPool := make(chan pooledLdapClient, 10)
-	var opts AuthErrorHandlers
-	if len(errHndlrs) > 0 {
-		opts = errHndlrs[0]
+// ValidateLDAP performs a lightweight connection and search against the LDAP
+// server to verify that the configuration is valid and the server is reachable.
+func ValidateLDAP(l LdapServerInfo) error {
+	client, err := currentLdapConnector(l)
+	if err != nil {
+		return err
 	}
+	defer client.Close()
+
+	// Perform a RootDSE search as a lightweight connectivity check.
+	searchRequest := ldap.NewSearchRequest(
+		"", ldap.ScopeBaseObject, ldap.NeverDerefAliases, 1, 0, false,
+		"(objectClass=*)", []string{"dn"}, nil,
+	)
+	sr, err := client.Search(searchRequest)
+	if err != nil {
+		return err
+	}
+	if len(sr.Entries) == 0 {
+		return fmt.Errorf("LDAP validation failed: no entries returned for RootDSE search")
+	}
+	return nil
+}
+
+func LdapGroupProvider(ldapServerInfo LdapServerInfo, opts AuthErrorHandlers) (func(http.Handler) http.Handler, io.Closer) {
+	pool := make(ldapPool, 10)
 	opts.ApplyGeneralError()
 
 	return func(next http.Handler) http.Handler {
@@ -271,30 +309,19 @@ func LdapGroupProvider(ldapServerInfo LdapServerInfo, errHndlrs ...AuthErrorHand
 
 			// Try to get a connection from the pool
 			select {
-			case pooledConn := <-ldapPool:
+			case pooledConn := <-pool:
 				ldapServiceConn = pooledConn.client
 				connCreatedAt = pooledConn.createdAt
 
 				if ldapServerInfo.ConnectionTTL > 0 && time.Since(connCreatedAt) > ldapServerInfo.ConnectionTTL {
-					// Connection has exceeded its TTL and may have stale Kerberos tickets
 					ldapServiceConn.Close()
 					ldapServiceConn = nil
-				} else {
-					// We got a connection from the pool. Let's check if it's still alive.
-					// A simple search is a good way to do this.
-					searchRequest := ldap.NewSearchRequest("", ldap.ScopeBaseObject, ldap.NeverDerefAliases, 0, 0, false, "(objectClass=*)", []string{"dn"}, nil)
-					if _, err := ldapServiceConn.Search(searchRequest); err != nil {
-						// Connection is likely stale. Close it and prepare to create a new one.
-						ldapServiceConn.Close()
-						ldapServiceConn = nil
-					}
 				}
 			default:
-				// Pool is empty, will create a new connection below.
+				// Pool is empty
 			}
 
 			if ldapServiceConn == nil {
-				// Create a new connection if the pool was empty or the connection from the pool was stale.
 				ldapServiceConn, err = currentLdapConnector(ldapServerInfo)
 				if err != nil {
 					opts.GetOnLdapConnectionError()(w, r, err)
@@ -305,22 +332,32 @@ func LdapGroupProvider(ldapServerInfo LdapServerInfo, errHndlrs ...AuthErrorHand
 
 			userGroups, err := getUserGroups(ldapServiceConn, ldapServerInfo.UsersDN, username)
 			if err != nil {
-				// On error, close the connection and don't return it to the pool
+				// Pooled connection may be stale — close it and retry once with a fresh connection.
 				ldapServiceConn.Close()
-				opts.GetOnLdapLookupError()(w, r, err)
-				return
+				ldapServiceConn, err = currentLdapConnector(ldapServerInfo)
+				if err != nil {
+					opts.GetOnLdapConnectionError()(w, r, err)
+					return
+				}
+				connCreatedAt = time.Now()
+
+				userGroups, err = getUserGroups(ldapServiceConn, ldapServerInfo.UsersDN, username)
+				if err != nil {
+					ldapServiceConn.Close()
+					opts.GetOnLdapLookupError()(w, r, err)
+					return
+				}
 			}
 
-			// If successful, try to return the connection to the pool
+			// Return connection to pool
 			select {
-			case ldapPool <- pooledLdapClient{client: ldapServiceConn, createdAt: connCreatedAt}:
+			case pool <- pooledLdapClient{client: ldapServiceConn, createdAt: connCreatedAt}:
 			default:
-				// Pool is full, close the connection
 				ldapServiceConn.Close()
 			}
 
 			ctx := context.WithValue(r.Context(), ContextKeyUserGroups, userGroups)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
-	}
+	}, pool
 }

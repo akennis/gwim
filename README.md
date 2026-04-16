@@ -2,7 +2,7 @@
 
 **Windows-native Kerberos/NTLM authentication and TLS for Go HTTP servers.**
 
-Deploying a Go service inside a corporate Active Directory domain normally means standing up IIS or a reverse proxy just to get Windows Integrated Authentication. `gwim` removes that requirement. It wraps any `http.Handler` with Kerberos authentication, enriches the request context with LDAP group memberships, and pulls TLS certificates straight from the Windows certificate store — letting you ship a single self-contained `.exe`.
+Deploying a Go service inside a corporate Active Directory domain normally means standing up IIS or a reverse proxy just to get Windows integrated authentication, authorization, and TLS. `gwim` removes that requirement. It wraps any `http.Handler` with Windows-native Kerberos authentication, enriches the request context with LDAP group memberships, and pulls TLS certificates straight from the Windows certificate store — letting you ship a single self-contained web server `.exe` that runs seamlessly in a Windows domain environment. With `gwim`, you can run Go websites securely right where your users are and just how your Windows infrastructure is configured.
 
 ## Prerequisites
 
@@ -12,7 +12,7 @@ Deploying a Go service inside a corporate Active Directory domain normally means
 | Active Directory domain membership | Kerberos authentication |
 | A registered SPN for the server host (e.g. `HTTP/myserver.corp.local`) | Kerberos authentication |
 | A certificate imported into the Windows certificate store | `GetWin32Cert` / `GetCertificateFunc` |
-| LDAP-reachable domain controller + a service account SPN | `NewLdapGroupProvider` |
+| LDAP-reachable domain controller + a service account SPN | `NewLDAPProvider` |
 
 ## Installation
 
@@ -42,8 +42,9 @@ func main() {
         w.Write([]byte("Hello, " + username))
     })
 
-    // Wrap the handler with Kerberos authentication (useNTLM = false)
-    handler, _ := gwim.NewSSPIHandler(mux, false)
+    // Create a Kerberos authentication provider
+    sspiProvider, _ := gwim.NewSSPIProvider()
+    defer sspiProvider.Close()
 
     // Retrieve a TLS certificate from the Windows certificate store
     certSource, _ := gwim.GetWin32Cert("myserver.corp.local", gwim.CertStoreLocalMachine)
@@ -51,7 +52,7 @@ func main() {
 
     srv := &http.Server{
         Addr:    ":8443",
-        Handler: handler,
+        Handler: sspiProvider.Middleware(mux),
         TLSConfig: &tls.Config{
             Certificates: []tls.Certificate{certSource.Certificate},
         },
@@ -71,10 +72,10 @@ Requests flow through the middleware chain in the following order:
 Client Request
   │
   ▼
-SSPI Handler (Kerberos or NTLM negotiation)
+SSPI Middleware (Kerberos or NTLM negotiation)
   │  ── sets the authenticated username in the request context
   ▼
-LDAP Group Provider (optional)
+LDAP Middleware (optional)
   │  ── looks up the user's group memberships and adds them to the context
   ▼
 Your Application Handler
@@ -83,7 +84,7 @@ Your Application Handler
 ```
 
 > [!IMPORTANT]
-> **Middleware must be applied in reverse execution order.** Wrap your router with the LDAP provider first, then wrap the result with the SSPI handler. The LDAP provider depends on the username that the SSPI handler places in the context.
+> **Middleware Order:** `SSPIProvider` must always be applied *before* `LDAPProvider` (i.e. `SSPIProvider` should be the outermost middleware). This ensures the user's identity is established in the request context before the LDAP provider attempts to look up their group memberships.
 
 ## Usage Examples
 
@@ -96,36 +97,118 @@ See the [examples](examples) directory for complete, runnable servers:
 
 ### Authentication
 
-- `NewSSPIHandler(next http.Handler, useNTLM bool, options ...AuthErrorHandlers) (http.Handler, error)` — Creates a Windows native authentication middleware that wraps an existing `http.Handler`. The `useNTLM` boolean selects NTLM or Kerberos. Optional `AuthErrorHandlers` allow customizing error responses. Returns an error if Windows SSPI credentials cannot be acquired (e.g. the `Negotiate` security package is unavailable). On success, the authenticated username is stored in the request context and readable via `gwim.User(r)`. On failure, the appropriate error handler is invoked (default: 401 Unauthorized).
+`gwim` uses the **Middleware Factory Pattern**: create a provider once at startup, then register its `.Middleware` method with any router's `Use()` call or use it to wrap handlers manually. The `.Middleware` method satisfies the standard `func(http.Handler) http.Handler` signature, making it compatible with any router that supports standard Go middleware.
+
+#### `NewSSPIProvider`
+
+```go
+sspiProvider, err := gwim.NewSSPIProvider(opts ...SSPIOption) (*SSPIProvider, error)
+```
+
+Acquires Windows SSPI credentials and returns a provider. Any credential acquisition error is surfaced here at startup rather than on the first request.
+
+```go
+// Kerberos (production default)
+sspiProvider, err := gwim.NewSSPIProvider()
+
+// NTLM (local / non-domain development)
+sspiProvider, err := gwim.NewSSPIProvider(gwim.WithNTLM())
+
+// With custom error handling
+sspiProvider, err := gwim.NewSSPIProvider(
+    gwim.WithNTLM(),
+    gwim.WithSSPIErrorHandlers(gwim.AuthErrorHandlers{
+        OnGeneralError: myErrorHandler,
+    }),
+)
+```
+
+Use the provider:
+
+```go
+// Standard net/http
+handler := sspiProvider.Middleware(mux)
+
+// Any router with Use()
+router.Use(sspiProvider.Middleware)
+```
+
+**SSPIOption functions:**
+
+| Option | Description |
+|---|---|
+| `WithNTLM()` | Use NTLM instead of Kerberos. Required for non-domain or localhost scenarios. |
+| `WithSSPIErrorHandlers(h AuthErrorHandlers)` | Override default error responses. |
+
+**Lifecycle:** Call `sspiProvider.Close()` on server shutdown to release Windows credential handles.
 
 > [!NOTE]
 > **Kerberos should be used in production** as it is significantly more secure. NTLM support is included only to facilitate local development where the developer is hitting the server from a browser on the same host (a scenario where Kerberos loopback authentication does not work).
 
-- `ConfigureNTLM(server *http.Server)` — Configures the `http.Server` with the `ConnContext` callback required for NTLM connection tracking. NTLM is connection-oriented — each TCP connection carries its own authentication state. This function assigns a unique ID to every connection so the NTLM handler can correlate the two-step token exchange across requests on the same keep-alive connection. **Only required when using NTLM; not needed for Kerberos.**
+#### `ConfigureNTLM`
+
+```go
+gwim.ConfigureNTLM(server *http.Server)
+```
+
+Configures the `http.Server` with the `ConnContext` callback required for NTLM connection tracking. NTLM is connection-oriented — each TCP connection carries its own authentication state. This function assigns a unique ID to every connection so the NTLM handler can correlate the two-step token exchange across requests on the same keep-alive connection. **Only required when using NTLM; not needed for Kerberos.**
 
 ### LDAP Group Authorization
 
-- `NewLdapGroupProvider(next http.Handler, ldapAddress, ldapUsersDN, ldapServiceAccountSPN string, ldapTimeout, ldapTTL time.Duration, options ...AuthErrorHandlers) http.Handler` — Returns a middleware that enriches the request context with the authenticated user's LDAP group memberships (transitively).
+#### `NewLDAPProvider`
 
-  | Parameter | Example | Description |
-  |---|---|---|
-  | `ldapAddress` | `dc01.corp.local:636` | Host and port of the LDAP / domain controller (LDAPS is always used) |
-  | `ldapUsersDN` | `OU=Users,DC=corp,DC=local` | Distinguished Name of the OU containing user accounts |
-  | `ldapServiceAccountSPN` | `HTTP/myserver.corp.local` | SPN of the LDAP server |
-  | `ldapTimeout` | `gwim.DefaultLdapTimeout` | Per-operation timeout for every LDAP call; pass `gwim.DefaultLdapTimeout` for the standard 5-second value |
-  | `ldapTTL` | `gwim.DefaultLdapTTL` | Maximum lifetime of a connection to prevent stale Kerberos tickets; pass `gwim.DefaultLdapTTL` for 1 hour |
+```go
+ldapProvider, err := gwim.NewLDAPProvider(opts ...LDAPOption) (*LDAPProvider, error)
+```
+
+Returns a provider that enriches an authenticated request's context with the user's Active Directory group memberships (transitively, via the `tokenGroups` attribute). Groups are returned as LDAP Distinguished Names (DNs), e.g. `CN=AppAdmins,OU=Groups,DC=corp,DC=local`.
+
+**Startup validation:** `NewLDAPProvider` performs a synchronous connectivity check before returning. It opens a TLS (LDAPS) connection to the configured address, authenticates via GSSAPI/Kerberos bind using the server's current-user credentials, and executes a RootDSE search. If any step fails, an error is returned here at startup rather than on the first request.
+
+At runtime, the provider maintains an internal connection pool (capacity: 10). On each request a pooled connection is health-checked with a lightweight RootDSE probe before use; connections that fail the probe or exceed their TTL are discarded and a new one is created.
+
+```go
+ldapProvider, err := gwim.NewLDAPProvider(
+    gwim.WithLDAPAddress("dc01.corp.local:636"),
+    gwim.WithLDAPUsersDN("OU=Users,DC=corp,DC=local"),
+    gwim.WithLDAPServiceAccountSPN("LDAP/DC1.corp.local"),
+)
+if err != nil {
+    log.Fatalf("failed to create LDAP provider: %v", err)
+}
+
+// Wrap the LDAP-wrapped handler with SSPI (SSPI runs first)
+handler = sspiProvider.Middleware(ldapProvider.Middleware(mux))
+
+// Or with a router
+router.Use(sspiProvider.Middleware)
+router.Use(ldapProvider.Middleware)
+```
+
+**LDAPOption functions:**
+
+| Option | Description |
+|---|---|
+| `WithLDAPAddress(addr string)` | Host and port of the LDAP / domain controller (LDAPS is always used) |
+| `WithLDAPUsersDN(dn string)` | Distinguished Name of the OU containing user accounts |
+| `WithLDAPServiceAccountSPN(spn string)` | SPN of the LDAP service account used for GSSAPI bind |
+| `WithLDAPTimeout(d time.Duration)` | Per-operation timeout; defaults to `DefaultLdapTimeout` (5s) |
+| `WithLDAPConnectionTTL(d time.Duration)` | Max lifetime of a pooled connection; defaults to `DefaultLdapTTL` (1h) |
+| `WithLDAPErrorHandlers(h AuthErrorHandlers)` | Override default error responses |
+
+**Lifecycle:** Call `ldapProvider.Close()` on server shutdown to drain the connection pool and release Windows credentials used for the LDAP bind.
 
 ### Request Context Helpers
 
 - `User(r *http.Request) (string, bool)` — Returns the authenticated username from the request context.
-- `SetUser(r *http.Request, username string) *http.Request` — Injects a username into the request context. If a username is already present when the SSPI handler runs, authentication is skipped — use this to restore a session without re-running SSPI.
-- `UserGroups(r *http.Request) ([]string, bool)` — Returns the user's group memberships from the request context.
-- `SetUserGroups(r *http.Request, groups []string) *http.Request` — Injects group memberships into the request context. If groups are already present when the LDAP provider runs, the LDAP lookup is skipped — use this to restore cached groups from a session.
+- `SetUser(r *http.Request, username string) *http.Request` — Injects a username into the request context. If a username is already present when the SSPI middleware runs, authentication is skipped — use this to restore a session without re-running SSPI.
+- `UserGroups(r *http.Request) ([]string, bool)` — Returns the user's group memberships from the request context as LDAP Distinguished Names (DNs), e.g. `CN=AppAdmins,OU=Groups,DC=corp,DC=local`.
+- `SetUserGroups(r *http.Request, groups []string) *http.Request` — Injects group memberships into the request context. If groups are already present when the LDAP middleware runs, the LDAP lookup is skipped — use this to restore cached groups from a session.
 
 Use `SetUser` and `SetUserGroups` together to restore a previously authenticated identity from a session store, avoiding re-authentication and LDAP lookups on every request:
 
 ```go
-// In your session middleware, before the SSPI handler runs:
+// In your session middleware, before the SSPI middleware runs:
 if sessionUser, ok := getSession(r); ok {
     r = gwim.SetUser(r, sessionUser)
     r = gwim.SetUserGroups(r, sessionUser.Groups)
@@ -136,13 +219,13 @@ See [sec-win-server/main.go](examples/sec-win-server/main.go) for a full working
 
 ### TLS Certificate
 
-- `GetWin32Cert(certSubject string, store CertStore) (*CertificateSource, error)` — Retrieves a TLS certificate from the Windows certificate store by Common Name. Use `CertStoreLocalMachine` or `CertStoreCurrentUser` for `store`. The returned `CertificateSource.Certificate` is a `tls.Certificate` ready for use in `tls.Config.Certificates`. Call `Close()` on the source when it is no longer needed (e.g. on server shutdown) to release Windows store handles.
+- `GetWin32Cert(certSubject string, store CertStore) (*CertificateSource, error)` — Retrieves a TLS certificate from the Windows certificate store by Common Name. Use `CertStoreLocalMachine` or `CertStoreCurrentUser` for `store`. The certificate is validated before being returned: it must not be expired, must carry `ExtKeyUsageServerAuth`, and its full issuer chain must pass verification via the Windows CryptoAPI. The returned `CertificateSource.Certificate` is a `tls.Certificate` ready for use in `tls.Config.Certificates`. Call `Close()` on the source when it is no longer needed (e.g. on server shutdown) to release Windows store handles.
 
 - `GetCertificateFunc(certSubject string, store CertStore, refreshThreshold, retryInterval time.Duration) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), io.Closer, error)` — Like `GetWin32Cert` but returns a `tls.Config.GetCertificate` callback that transparently refreshes the certificate in the background when it is within `refreshThreshold` of expiry, enabling zero-downtime rotation. Pass `DefaultRefreshThreshold` and `DefaultRetryInterval` for standard values. Call `Close()` on the returned `io.Closer` after `http.Server.Shutdown` returns.
 
 ### Error Handling (`AuthErrorHandlers`)
 
-Both `NewSSPIHandler` and `NewLdapGroupProvider` accept a variadic `AuthErrorHandlers` struct to customize error responses. Each field is an `AuthErrorHandler func(w http.ResponseWriter, r *http.Request, err error)`:
+Both `WithSSPIErrorHandlers` and `WithLDAPErrorHandlers` accept an `AuthErrorHandlers` struct to customize error responses. Each field is an `AuthErrorHandler func(w http.ResponseWriter, r *http.Request, err error)`:
 
 | Field | Triggered when… |
 |---|---|
@@ -155,6 +238,8 @@ Both `NewSSPIHandler` and `NewLdapGroupProvider` accept a variadic `AuthErrorHan
 | `OnGeneralError` | Catch-all: fills in for any of the above handlers that is not explicitly set |
 
 If no options are provided, sensible defaults are used (plain-text HTTP error responses).
+
+Requests do not progress to the next request hander in the chain once an error has occurred.  The error handler is executed and control is sent back up the request hander chain (i.e. the earlier handlers).
 
 ## Integration Testing
 

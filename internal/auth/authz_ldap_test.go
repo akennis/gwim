@@ -7,6 +7,7 @@ package auth
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -251,7 +252,8 @@ func TestLdapGroupProvider(t *testing.T) {
 			}
 		})
 
-		handler := LdapGroupProvider(serverInfo, DefaultAuthErrorHandlers())(nextHandler)
+		mw, _ := LdapGroupProvider(serverInfo, DefaultAuthErrorHandlers())
+		handler := mw(nextHandler)
 
 		req := httptest.NewRequest("GET", "/", nil)
 		ctx := context.WithValue(req.Context(), ContextKeyUsername, "testuser")
@@ -264,4 +266,60 @@ func TestLdapGroupProvider(t *testing.T) {
 			t.Errorf("Expected status OK, got %d", rr.Code)
 		}
 	})
+}
+
+func TestLdapPoolClose(t *testing.T) {
+	var closedCount int
+	mockClient := &mockLdapClient{
+		CloseFunc: func() error {
+			closedCount++
+			return nil
+		},
+	}
+
+	pool := make(ldapPool, 5)
+	pool <- pooledLdapClient{client: mockClient}
+	pool <- pooledLdapClient{client: mockClient}
+	pool <- pooledLdapClient{client: mockClient}
+
+	if err := pool.Close(); err != nil {
+		t.Errorf("pool.Close() unexpected error: %v", err)
+	}
+
+	if closedCount != 3 {
+		t.Errorf("Expected 3 connections to be closed, got %d", closedCount)
+	}
+
+	// Verify the pool is empty and Close returns nil on subsequent calls (because it's empty)
+	select {
+	case <-pool:
+		t.Error("Pool should be empty after Close")
+	default:
+	}
+
+	if err := pool.Close(); err != nil {
+		t.Errorf("Subsequent pool.Close() on empty pool should not error, got: %v", err)
+	}
+}
+
+func TestLdapPoolCloseErrors(t *testing.T) {
+	err1 := fmt.Errorf("error 1")
+	err2 := fmt.Errorf("error 2")
+
+	mockClient1 := &mockLdapClient{CloseFunc: func() error { return err1 }}
+	mockClient2 := &mockLdapClient{CloseFunc: func() error { return err2 }}
+
+	pool := make(ldapPool, 2)
+	pool <- pooledLdapClient{client: mockClient1}
+	pool <- pooledLdapClient{client: mockClient2}
+
+	err := pool.Close()
+	if err == nil {
+		t.Fatal("Expected error from pool.Close(), got nil")
+	}
+
+	// Verify that both errors are included
+	if !reflect.DeepEqual(err, errors.Join(err1, err2)) && !reflect.DeepEqual(err, errors.Join(err2, err1)) {
+		t.Errorf("Unexpected aggregated error: %v", err)
+	}
 }

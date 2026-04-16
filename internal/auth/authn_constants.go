@@ -5,9 +5,9 @@
 package auth
 
 const (
-	AUTHORIZATION = "Authorization"
-	NEGOTIATE     = "Negotiate"
-	NEGOTIATE_SPC = NEGOTIATE + " "
-	TOKEN_OFFSET  = len(NEGOTIATE_SPC)
-	WWW_AUTH      = "WWW-Authenticate"
+	authorization   = "Authorization"
+	negotiate       = "Negotiate"
+	negotiateSpc    = negotiate + " "
+	tokenOffset     = len(negotiateSpc)
+	wwwAuthenticate = "WWW-Authenticate"
 )
