@@ -44,6 +44,7 @@ func main() {
 
     // Create a Kerberos authentication provider
     sspiProvider, _ := gwim.NewSSPIProvider()
+    defer sspiProvider.Close()
 
     // Retrieve a TLS certificate from the Windows certificate store
     certSource, _ := gwim.GetWin32Cert("myserver.corp.local", gwim.CertStoreLocalMachine)
@@ -83,7 +84,7 @@ Your Application Handler
 ```
 
 > [!IMPORTANT]
-> **Refer to your server framework's documentation for instructions on how to apply middleware in the correct order.  Some frameworks (such has the standard net/http framework) require middleware to be applied in reverse order (i.e. LDAP applied before SSPI), while other frameworks require middleware to be applied in the order of actual request flow (i.e. SSPI applied before LDAP).**
+> **Middleware Order:** `SSPIProvider` must always be applied *before* `LDAPProvider` (i.e. `SSPIProvider` should be the outermost middleware). This ensures the user's identity is established in the request context before the LDAP provider attempts to look up their group memberships.
 
 ## Usage Examples
 
@@ -96,7 +97,7 @@ See the [examples](examples) directory for complete, runnable servers:
 
 ### Authentication
 
-`gwim` uses the **Middleware Factory Pattern**: create a provider once at startup, then register its `.Middleware` method with any router's `Use()` call or use it to wrap handlers manually. The `.Middleware` method satisfies the standard `func(http.Handler) http.Handler` signature, making it compatible with `net/http`, Gorilla Mux, Chi, and adapter-compatible with Gin, Echo, and Fiber.
+`gwim` uses the **Middleware Factory Pattern**: create a provider once at startup, then register its `.Middleware` method with any router's `Use()` call or use it to wrap handlers manually. The `.Middleware` method satisfies the standard `func(http.Handler) http.Handler` signature, making it compatible with any router that supports standard Go middleware.
 
 #### `NewSSPIProvider`
 
@@ -139,6 +140,8 @@ router.Use(sspiProvider.Middleware)
 | `WithNTLM()` | Use NTLM instead of Kerberos. Required for non-domain or localhost scenarios. |
 | `WithSSPIErrorHandlers(h AuthErrorHandlers)` | Override default error responses. |
 
+**Lifecycle:** Call `sspiProvider.Close()` on server shutdown to release Windows credential handles.
+
 > [!NOTE]
 > **Kerberos should be used in production** as it is significantly more secure. NTLM support is included only to facilitate local development where the developer is hitting the server from a browser on the same host (a scenario where Kerberos loopback authentication does not work).
 
@@ -168,18 +171,18 @@ At runtime, the provider maintains an internal connection pool (capacity: 10). O
 ldapProvider, err := gwim.NewLDAPProvider(
     gwim.WithLDAPAddress("dc01.corp.local:636"),
     gwim.WithLDAPUsersDN("OU=Users,DC=corp,DC=local"),
-    gwim.WithLDAPServiceAccountSPN("HTTP/myserver.corp.local"),
+    gwim.WithLDAPServiceAccountSPN("LDAP/DC1.corp.local"),
 )
 if err != nil {
     log.Fatalf("failed to create LDAP provider: %v", err)
 }
 
-// Wrap the SSPI-wrapped handler
-handler = ldapProvider.Middleware(sspiProvider.Middleware(mux))
+// Wrap the LDAP-wrapped handler with SSPI (SSPI runs first)
+handler = sspiProvider.Middleware(ldapProvider.Middleware(mux))
 
 // Or with a router
-router.Use(ldapProvider.Middleware)
 router.Use(sspiProvider.Middleware)
+router.Use(ldapProvider.Middleware)
 ```
 
 **LDAPOption functions:**
@@ -193,17 +196,7 @@ router.Use(sspiProvider.Middleware)
 | `WithLDAPConnectionTTL(d time.Duration)` | Max lifetime of a pooled connection; defaults to `DefaultLdapTTL` (1h) |
 | `WithLDAPErrorHandlers(h AuthErrorHandlers)` | Override default error responses |
 
-### Framework Adapters
-
-The `.Middleware` method returns the standard `func(http.Handler) http.Handler` signature supported directly by most routers:
-
-```go
-// Gin
-router.Use(gin.WrapH(sspiProvider.Middleware(http.DefaultServeMux)))
-
-// Echo
-e.Use(echo.WrapMiddleware(sspiProvider.Middleware))
-```
+**Lifecycle:** Call `ldapProvider.Close()` on server shutdown to drain the connection pool and release Windows credentials used for the LDAP bind.
 
 ### Request Context Helpers
 

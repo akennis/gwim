@@ -285,6 +285,7 @@ func runServer(serverAddr, certSubject string, certFromCurrentUser, useNTLM bool
 	if err != nil {
 		return fmt.Errorf("failed to create SSPI provider: %w", err)
 	}
+	defer sspiProvider.Close() //nolint:errcheck
 	handler = sspiProvider.Middleware(handler)
 	log.Println("AUTHN/Z: --> Applied SSPI handler (Kerberos/NTLM)")
 

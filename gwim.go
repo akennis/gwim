@@ -109,6 +109,7 @@ func WithSSPIErrorHandlers(h AuthErrorHandlers) SSPIOption {
 // Create one with NewSSPIProvider, then register its Middleware method with
 // your router's Use() method or wrap handlers manually.
 type SSPIProvider struct {
+	creds      *sspi.Credentials
 	useNTLM    bool
 	middleware func(http.Handler) http.Handler
 }
@@ -135,7 +136,16 @@ func NewSSPIProvider(opts ...SSPIOption) (*SSPIProvider, error) {
 		mw = iauth.KerberosAuthn(serverCreds, cfg.errHandlers)
 	}
 
-	return &SSPIProvider{useNTLM: cfg.useNTLM, middleware: mw}, nil
+	return &SSPIProvider{creds: serverCreds, useNTLM: cfg.useNTLM, middleware: mw}, nil
+}
+
+// Close releases the Windows SSPI credentials held by this provider.
+// Call this on server shutdown.
+func (p *SSPIProvider) Close() error {
+	if p.creds == nil {
+		return nil
+	}
+	return p.creds.Release()
 }
 
 // Middleware satisfies func(http.Handler) http.Handler and can be passed
