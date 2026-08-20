@@ -2,14 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// certsrv-client is a minimal authenticated HTTP client — a curl-like tool
+// auth-get is a minimal authenticated HTTP client — a curl-like tool
 // for testing gwim's outbound transport against Windows-integrated-auth endpoints.
 //
 // Usage:
 //
-//	go run ./examples/certsrv-client --url https://ca01.corp.local/certsrv/
-//	go run ./examples/certsrv-client --url https://ca01.corp.local/certsrv/ --spn HTTP/ca01.corp.local
-//	go run ./examples/certsrv-client --url https://ca01.corp.local/certsrv/ --insecure
+//	go run ./examples/auth-get --url https://ca01.corp.local/certsrv/
+//	go run ./examples/auth-get --url https://ca01.corp.local/certsrv/ --spn HTTP/ca01.corp.local
+//	go run ./examples/auth-get --url https://ca01.corp.local/certsrv/ --insecure
 package main
 
 import (
