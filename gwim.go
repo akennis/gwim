@@ -281,6 +281,105 @@ func (p *LDAPProvider) Middleware(next http.Handler) http.Handler {
 	return p.middleware(next)
 }
 
+// --- Outbound authentication transports ---
+
+type clientTransportConfig struct {
+	base         http.RoundTripper
+	ntlmFallback bool
+}
+
+// ClientTransportOption configures an outbound authentication transport.
+type ClientTransportOption func(*clientTransportConfig)
+
+// WithClientBaseTransport sets the RoundTripper that actually sends the
+// authenticated requests, allowing custom TLS settings, timeouts or proxies.
+// Defaults to http.DefaultTransport, or an NTLM-compatible transport when
+// WithNTLMFallback is set (one connection per host, HTTP/2 disabled).
+func WithClientBaseTransport(rt http.RoundTripper) ClientTransportOption {
+	return func(c *clientTransportConfig) {
+		c.base = rt
+	}
+}
+
+// WithNTLMFallback enables NTLM-within-SPNEGO as a fallback when the server
+// returns a bare 401 to the initial Kerberos attempt. This mirrors how
+// browsers handle the Negotiate scheme: Kerberos is tried first, and NTLM is
+// used when Kerberos fails or the SPN is unknown to the KDC.
+//
+// When this option is set, the default base transport is replaced with one
+// that pins connections and disables HTTP/2, since NTLM binds its handshake
+// state to the underlying TCP connection. Requests are also serialised so that
+// two NTLM handshakes cannot interleave on the same connection.
+func WithNTLMFallback() ClientTransportOption {
+	return func(c *clientTransportConfig) {
+		c.ntlmFallback = true
+	}
+}
+
+// ntlmCompatibleTransport returns a transport suitable for NTLM-within-SPNEGO:
+// a single connection per host with HTTP/2 disabled. NTLM binds its
+// half-finished handshake to the TCP connection the challenge arrived on, so
+// both legs must travel the same one.
+func ntlmCompatibleTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxConnsPerHost = 1
+	t.MaxIdleConnsPerHost = 1
+	t.ForceAttemptHTTP2 = false
+	t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	return t
+}
+
+// NewNegotiateTransport returns an http.RoundTripper that authenticates every
+// outbound request to spn with Kerberos (SPNEGO), using the calling process's
+// own Windows credentials — for a service, the identity of the account it runs
+// under. No keytab or stored password is involved and no user is impersonated,
+// so every request reaches the target as the service account itself.
+//
+// spn is the target's Service Principal Name, e.g. "HTTP/api.example.local".
+//
+// Pass WithNTLMFallback to also attempt NTLM-within-SPNEGO when the server
+// rejects Kerberos with a bare 401. This matches browser behaviour and is
+// useful when the SPN may not be registered or Kerberos is unavailable.
+//
+// The returned io.Closer releases the Windows SSPI credentials; call it on
+// shutdown once the last request has completed. Credentials are acquired here
+// rather than lazily so that a misconfigured service account surfaces at
+// startup instead of on the first request.
+//
+// Use it as the Transport of an http.Client:
+//
+//	rt, closer, err := gwim.NewNegotiateTransport("HTTP/api.example.local")
+//	if err != nil {
+//		return err
+//	}
+//	defer closer.Close()
+//	client := &http.Client{Transport: rt, Timeout: 15 * time.Second}
+//
+// Requests with a body should be built with http.NewRequest and a
+// *bytes.Reader, *bytes.Buffer or *strings.Reader so that the body can be
+// replayed if the server requires more than one negotiation leg.
+func NewNegotiateTransport(spn string, opts ...ClientTransportOption) (http.RoundTripper, io.Closer, error) {
+	cfg := applyClientTransportOptions(opts)
+
+	if cfg.base == nil && cfg.ntlmFallback {
+		cfg.base = ntlmCompatibleTransport()
+	}
+
+	transport, err := iauth.NewNegotiateTransport(spn, cfg.ntlmFallback, cfg.base)
+	if err != nil {
+		return nil, nil, err
+	}
+	return transport, transport, nil
+}
+
+func applyClientTransportOptions(opts []ClientTransportOption) *clientTransportConfig {
+	cfg := &clientTransportConfig{}
+	for _, o := range opts {
+		o(cfg)
+	}
+	return cfg
+}
+
 // --- TLS certificate helpers ---
 
 // CertStore identifies which Windows certificate store to search.
