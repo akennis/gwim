@@ -202,14 +202,14 @@ router.Use(ldapProvider.Middleware)
 
 Authenticate requests *to* another service as the calling process's own Windows identity — for a service, the account it runs under. No keytab, no stored password, and no user impersonation.
 
-- `NewNegotiateTransport(spn string, opts ...ClientTransportOption) (http.RoundTripper, io.Closer, error)` — Kerberos (SPNEGO) against `spn`, e.g. `HTTP/api.example.local`. Handles multi-leg negotiation and verifies the server's mutual authentication token when one is returned.
-- `NewNTLMTransport(opts ...ClientTransportOption) (http.RoundTripper, io.Closer, error)` — NTLM, for targets that cannot do Kerberos: no registered SPN, reached by IP address, or outside the domain. Needs no SPN. NTLM offers no mutual authentication, so prefer `NewNegotiateTransport` where the target supports it.
+- `NewNegotiateTransport(spn string, opts ...ClientTransportOption) (http.RoundTripper, io.Closer, error)` — Kerberos (SPNEGO) against `spn`, e.g. `HTTP/api.example.local`. Handles multi-leg negotiation and verifies the server's mutual authentication token when one is returned. Pass `WithNTLMFallback` to also attempt NTLM-within-SPNEGO when the server rejects Kerberos with a bare 401, matching browser behaviour.
 
-Both acquire credentials up front so a misconfigured account fails at startup rather than on the first request; call `Close()` on the returned `io.Closer` on shutdown.
+Credentials are acquired up front so a misconfigured account fails at startup rather than on the first request; call `Close()` on the returned `io.Closer` on shutdown.
 
 | Option | Description |
 | --- | --- |
 | `WithClientBaseTransport(rt http.RoundTripper)` | RoundTripper that sends the authenticated requests |
+| `WithNTLMFallback()` | Fall back to NTLM-within-SPNEGO when the server rejects Kerberos with a bare 401; also switches the default base transport to one that pins connections and disables HTTP/2 |
 
 ```go
 rt, closer, err := gwim.NewNegotiateTransport("HTTP/api.example.local")
@@ -224,7 +224,7 @@ resp, err := client.Get("https://api.example.local/auth/token")
 
 Build requests that carry a body with `http.NewRequest` and a `*bytes.Reader`, `*bytes.Buffer` or `*strings.Reader` so the body can be replayed if the server needs more than one leg. A `401` the server does not accompany with a continuation token is returned to the caller unchanged.
 
-**NTLM and connections:** NTLM is connection-oriented — the server binds a half-finished handshake to the connection its challenge arrived on. `NewNTLMTransport` therefore defaults to a base transport allowing a single connection per host with HTTP/2 disabled, and serialises its requests so two handshakes cannot interleave on that connection. Expect one request at a time to the target. If you supply your own base transport with `WithClientBaseTransport`, it must preserve those properties.
+**NTLM and connections:** NTLM is connection-oriented — the server binds a half-finished handshake to the connection its challenge arrived on. When `WithNTLMFallback` is set, the default base transport is replaced with one that allows a single connection per host with HTTP/2 disabled, and requests are serialised so two handshakes cannot interleave on that connection. Expect one request at a time to the target. If you supply your own base transport with `WithClientBaseTransport`, it must preserve those properties.
 
 ### Request Context Helpers
 
