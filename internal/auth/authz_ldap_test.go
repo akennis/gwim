@@ -78,6 +78,7 @@ func TestGetUserGroups(t *testing.T) {
 		searchSetup func(m *mockLdapClient)
 		expected    []string
 		wantErr     bool
+		wantErrIs   error
 	}{
 		{
 			name:     "Success",
@@ -129,8 +130,9 @@ func TestGetUserGroups(t *testing.T) {
 					return &ldap.SearchResult{Entries: []*ldap.Entry{}}, nil
 				}
 			},
-			expected: []string{},
-			wantErr:  false,
+			expected:  nil,
+			wantErr:   true,
+			wantErrIs: ErrUserNotFound,
 		},
 		{
 			name:     "SearchError",
@@ -195,15 +197,53 @@ func TestGetUserGroups(t *testing.T) {
 			m := &mockLdapClient{}
 			tt.searchSetup(m)
 
-			groups, err := getUserGroups(m, "OU=Users,DC=example,DC=com", tt.username)
+			groups, err := getUserGroups(context.Background(), m, "OU=Users,DC=example,DC=com", tt.username)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("getUserGroups() error = %v, wantErr %v", err, tt.wantErr)
 				return
+			}
+			if tt.wantErrIs != nil && !errors.Is(err, tt.wantErrIs) {
+				t.Errorf("getUserGroups() error = %v, want errors.Is(err, %v)", err, tt.wantErrIs)
 			}
 			if !reflect.DeepEqual(groups, tt.expected) {
 				t.Errorf("getUserGroups() = %v, want %v", groups, tt.expected)
 			}
 		})
+	}
+}
+
+func TestGetUserGroupsAbortsBeforeBatchSearchWhenContextDone(t *testing.T) {
+	// 101 SIDs forces at least one batch search iteration.
+	sids := make([][]byte, 101)
+	for i := range sids {
+		sids[i] = []byte{byte(i)}
+	}
+	m := &mockLdapClient{
+		SearchFunc: func(req *ldap.SearchRequest) (*ldap.SearchResult, error) {
+			if req.BaseDN == "OU=Users,DC=example,DC=com" {
+				return &ldap.SearchResult{
+					Entries: []*ldap.Entry{{DN: "CN=testuser,OU=Users,DC=example,DC=com"}},
+				}, nil
+			}
+			if req.Scope == ldap.ScopeBaseObject {
+				return &ldap.SearchResult{
+					Entries: []*ldap.Entry{{
+						DN:         "CN=testuser,OU=Users,DC=example,DC=com",
+						Attributes: []*ldap.EntryAttribute{{Name: "tokenGroups", ByteValues: sids}},
+					}},
+				}, nil
+			}
+			t.Error("batch SID search ran after the context was already done")
+			return nil, fmt.Errorf("should not search")
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := getUserGroups(ctx, m, "OU=Users,DC=example,DC=com", "testuser")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("getUserGroups() error = %v, want context.Canceled", err)
 	}
 }
 

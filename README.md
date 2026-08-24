@@ -165,7 +165,7 @@ Returns a provider that enriches an authenticated request's context with the use
 
 **Startup validation:** `NewLDAPProvider` performs a synchronous connectivity check before returning. It opens a TLS (LDAPS) connection to the configured address, authenticates via GSSAPI/Kerberos bind using the server's current-user credentials, and executes a RootDSE search. If any step fails, an error is returned here at startup rather than on the first request.
 
-At runtime, the provider maintains an internal connection pool (capacity: 10). On each request a pooled connection is health-checked with a lightweight RootDSE probe before use; connections that fail the probe or exceed their TTL are discarded and a new one is created.
+At runtime, the provider maintains an internal connection pool (capacity: 10). A pooled connection older than its TTL is discarded before use. A lookup that fails on a pooled connection is assumed to have hit a stale one, so the connection is closed and the lookup is retried exactly once on a freshly dialled connection; a second failure is reported to the caller.
 
 ```go
 ldapProvider, err := gwim.NewLDAPProvider(
@@ -197,6 +197,43 @@ router.Use(ldapProvider.Middleware)
 | `WithLDAPErrorHandlers(h AuthErrorHandlers)` | Override default error responses |
 
 **Lifecycle:** Call `ldapProvider.Close()` on server shutdown to drain the connection pool and release Windows credentials used for the LDAP bind.
+
+#### `Groups`
+
+```go
+func (p *LDAPProvider) Groups(ctx context.Context, username string) ([]string, error)
+```
+
+The lookup `Middleware` performs, made available to callers that have no request in hand — re-checking membership on a timer for a username recovered from a token, for example. It uses the same pooled connections and service-account bind, and returns the same transitive group DNs.
+
+```go
+groups, err := ldapProvider.Groups(ctx, "ajones")
+switch {
+case err == nil:
+    // groups holds the user's transitive memberships as DNs.
+case errors.Is(err, gwim.ErrUserNotFound):
+    // The directory answered: no such account, disabled, or ambiguous.
+    // A definitive deny — not an outage.
+case errors.Is(err, gwim.ErrLDAPConnection), errors.Is(err, gwim.ErrLDAPLookup):
+    // Membership is unknown. Decide whether to fail open or closed.
+default:
+    // ctx.Err(): the caller's deadline elapsed or the call was cancelled.
+}
+```
+
+**Errors.** Every directory failure wraps one of three sentinels, so callers can classify without parsing messages. The concrete error from the directory is wrapped alongside and stays reachable through `errors.Unwrap`.
+
+| Sentinel | Meaning | Membership |
+|---|---|---|
+| `ErrLDAPConnection` | The directory could not be reached, or the GSSAPI bind failed | Unknown |
+| `ErrLDAPLookup` | The directory was reachable but the search failed | Unknown |
+| `ErrUserNotFound` | The directory answered; the account does not exist, is disabled, or matched more than one entry. Wraps `ErrLDAPLookup` | Definitively none |
+
+The `ErrUserNotFound` / `ErrLDAPLookup` split is the one that matters for an authorization decision: the first is an answer, the second is an outage. Code that only needs "could not determine membership" can test `ErrLDAPLookup` alone and still catch both.
+
+**Context.** `ctx` bounds how long `Groups` waits, not the search itself. The underlying `go-ldap` client applies its timeout per connection rather than per call, so an in-flight search cannot be interrupted. When `ctx` is done first, `Groups` returns `ctx.Err()` promptly and the search runs to completion in the background, bounded by `WithLDAPTimeout`, after which its connection returns to the pool. The effective wait is `min(ctx deadline, WithLDAPTimeout)`.
+
+`Middleware` and `Groups` share one pool and one `Close`; using both on the same provider is expected.
 
 ### Outbound Authentication (Client)
 
