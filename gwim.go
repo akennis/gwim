@@ -168,6 +168,25 @@ type ldapConfig struct {
 	errHandlers AuthErrorHandlers
 }
 
+// Sentinel errors returned by LDAPProvider.Groups. Compare with errors.Is
+// rather than by message; the underlying directory error is wrapped alongside
+// and remains reachable through errors.Unwrap.
+var (
+	// ErrLDAPConnection reports that the directory could not be reached or the
+	// service-account bind failed. The user's group membership is unknown.
+	ErrLDAPConnection = iauth.ErrLDAPConnection
+
+	// ErrLDAPLookup reports that the directory was reachable but the search
+	// itself failed. The user's group membership is unknown.
+	ErrLDAPLookup = iauth.ErrLDAPLookup
+
+	// ErrUserNotFound reports that the directory answered and the account does
+	// not exist, is disabled, or matched more than one entry. This is a
+	// definitive answer rather than an outage, so it warrants a clean deny and
+	// not a server error. It wraps ErrLDAPLookup.
+	ErrUserNotFound = iauth.ErrUserNotFound
+)
+
 // LDAPOption configures an LDAPProvider.
 type LDAPOption func(*ldapConfig)
 
@@ -224,15 +243,14 @@ func WithLDAPErrorHandlers(h AuthErrorHandlers) LDAPOption {
 // register its Middleware method with your router or wrap handlers manually.
 // It must be placed after SSPIProvider in the middleware chain.
 type LDAPProvider struct {
-	middleware func(http.Handler) http.Handler
-	closer     io.Closer
+	lookup *iauth.GroupLookup
 }
 
 // Close drains the LDAP connection pool, closing all idle connections.
 // Call this on server shutdown after the HTTP server has stopped accepting
 // new requests.
 func (p *LDAPProvider) Close() error {
-	return p.closer.Close()
+	return p.lookup.Close()
 }
 
 // NewLDAPProvider returns an LDAPProvider configured by the given options.
@@ -268,8 +286,7 @@ func NewLDAPProvider(opts ...LDAPOption) (*LDAPProvider, error) {
 		return nil, fmt.Errorf("failed to validate LDAP configuration: %w", err)
 	}
 
-	mw, closer := iauth.LdapGroupProvider(ldapServerInfo, cfg.errHandlers)
-	return &LDAPProvider{middleware: mw, closer: closer}, nil
+	return &LDAPProvider{lookup: iauth.NewGroupLookup(ldapServerInfo, cfg.errHandlers)}, nil
 }
 
 // Middleware satisfies func(http.Handler) http.Handler and can be passed
@@ -278,7 +295,35 @@ func NewLDAPProvider(opts ...LDAPOption) (*LDAPProvider, error) {
 //	router.Use(ldapProvider.Middleware)
 //	handler := ldapProvider.Middleware(myHandler)
 func (p *LDAPProvider) Middleware(next http.Handler) http.Handler {
-	return p.middleware(next)
+	return p.lookup.Middleware(next)
+}
+
+// Groups returns the Active Directory group memberships of username as
+// distinguished names, using the same pooled connections and service-account
+// bind as Middleware. It is the lookup Middleware performs, made available to
+// callers that have no request in hand — re-checking membership on a timer for
+// a username recovered from a token, for example. username is normalized the
+// same way the authentication middleware normalizes it (stripping a DOMAIN\
+// prefix or @REALM suffix and lowercasing), so a token-derived username works
+// the same here as it does through Middleware.
+//
+// A failure wraps one of ErrLDAPConnection, ErrLDAPLookup, or ErrUserNotFound;
+// classify with errors.Is. The distinction matters: the first two mean the
+// membership is unknown and the caller must decide whether to fail closed,
+// while ErrUserNotFound is a definitive answer about a deleted, disabled, or
+// ambiguous account.
+//
+// ctx bounds how long Groups waits, not the search itself. The underlying LDAP
+// client applies its timeout per connection, so an in-flight search cannot be
+// interrupted: when ctx is done first, Groups returns ctx.Err() promptly and
+// the search runs to completion in the background, bounded by WithLDAPTimeout,
+// after which its connection returns to the pool. The effective wait is
+// min(ctx deadline, WithLDAPTimeout). The background lookup still checks ctx
+// before starting any new expensive work of its own — dialing a replacement
+// connection, or issuing another batch of group searches — so a burst of
+// abandoned calls does not pile unbounded connections onto the directory.
+func (p *LDAPProvider) Groups(ctx context.Context, username string) ([]string, error) {
+	return p.lookup.Groups(ctx, username)
 }
 
 // --- Outbound authentication transports ---
