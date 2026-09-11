@@ -188,6 +188,34 @@ func TestWin32CertStoreBackend_certKeyFails(t *testing.T) {
 	}
 }
 
+// TestWin32CertStoreBackend_legacyCSPKeyHint verifies that a CertKey failure
+// caused by a legacy CryptoAPI key (certtostore reports "CNG key was empty")
+// is wrapped with guidance pointing at the CNG Key Storage Provider.
+func TestWin32CertStoreBackend_legacyCSPKeyHint(t *testing.T) {
+	leaf := newFakeX509Cert(t, time.Now().Add(24*time.Hour))
+	mock := &mockWinCertStore{
+		certByCommonNameFn: func(_ string) (*x509.Certificate, any, [][]*x509.Certificate, error) {
+			return leaf, nil, nil, nil
+		},
+		certKeyFn: func(_ any) (crypto.Signer, error) {
+			return nil, fmt.Errorf("CNG key was empty")
+		},
+	}
+	_, err := (&win32CertStoreBackend{openFn: mockOpen(mock), verifyFn: mockVerifyChain([]*x509.Certificate{leaf})}).GetCertificate("mysubject", StoreLocalMachine)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "CNG key was empty") {
+		t.Errorf("error %q should preserve the underlying certtostore message", err)
+	}
+	if !strings.Contains(err.Error(), "Key Storage Provider") {
+		t.Errorf("error %q should hint at re-importing with a CNG Key Storage Provider", err)
+	}
+	if mock.closeCalls != 1 {
+		t.Errorf("store Close() called %d times, want 1", mock.closeCalls)
+	}
+}
+
 // TestWin32CertStoreBackend_selfSigned verifies that for a self-signed
 // certificate (chain length 1) the rawChain contains only the leaf and the
 // store is not closed on success.

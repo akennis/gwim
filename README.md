@@ -92,6 +92,7 @@ See the [examples](examples) directory for complete, runnable servers:
 
 - [**Minimal secure server**](examples/min-win-server/main.go) — TLS + Kerberos/NTLM authentication with optional LDAP group lookup, in under 200 lines.
 - [**Session-enabled secure server**](examples/sec-win-server/main.go) — adds session management and caching so that authentication and LDAP lookups happen once per session rather than on every request, with graceful shutdown and zero-downtime certificate rotation.
+- [**list-certs**](examples/list-certs/main.go) — CLI utility that prints the subject (Common Name) of every certificate in the Windows store in the exact form to pass to `GetWin32Cert` / `-cert-subject`, marking which ones `gwim` can actually load and which names are ambiguous. Run `go run ./examples/list-certs` (add `-store both -all` to see everything).
 
 ## API
 
@@ -194,6 +195,7 @@ router.Use(ldapProvider.Middleware)
 | `WithLDAPServiceAccountSPN(spn string)` | SPN of the LDAP service account used for GSSAPI bind |
 | `WithLDAPTimeout(d time.Duration)` | Per-operation timeout; defaults to `DefaultLdapTimeout` (5s) |
 | `WithLDAPConnectionTTL(d time.Duration)` | Max lifetime of a pooled connection; defaults to `DefaultLdapTTL` (1h) |
+| `WithLDAPUserAttributes(attrs ...string)` | Also read these AD attributes for the user (e.g. `"mail"`, `"displayName"`) on the same search as group resolution — no extra round trip. Exposed via `UserAttributes` / `UserAttribute` / `UserMail` |
 | `WithLDAPErrorHandlers(h AuthErrorHandlers)` | Override default error responses |
 
 **Lifecycle:** Call `ldapProvider.Close()` on server shutdown to drain the connection pool and release Windows credentials used for the LDAP bind.
@@ -269,14 +271,19 @@ Build requests that carry a body with `http.NewRequest` and a `*bytes.Reader`, `
 - `SetUser(r *http.Request, username string) *http.Request` — Injects a username into the request context. If a username is already present when the SSPI middleware runs, authentication is skipped — use this to restore a session without re-running SSPI.
 - `UserGroups(r *http.Request) ([]string, bool)` — Returns the user's group memberships from the request context as LDAP Distinguished Names (DNs), e.g. `CN=AppAdmins,OU=Groups,DC=corp,DC=local`.
 - `SetUserGroups(r *http.Request, groups []string) *http.Request` — Injects group memberships into the request context. If groups are already present when the LDAP middleware runs, the LDAP lookup is skipped — use this to restore cached groups from a session.
+- `UserAttributes(r *http.Request) (map[string][]string, bool)` — Returns the AD attributes requested with `WithLDAPUserAttributes`, keyed by a lower-cased name. `ok` is `true` once the LDAP middleware or `SetUserAttributes` has run, even if the map is empty.
+- `UserAttribute(r *http.Request, name string) (string, bool)` — First value of one requested attribute; `name` is matched case-insensitively. `ok` is `false` when the attribute was not requested, has no value, or the middleware has not run.
+- `UserMail(r *http.Request) (string, bool)` — Shorthand for `UserAttribute(r, "mail")` — the user's real AD email address. Requires `WithLDAPUserAttributes("mail", …)`.
+- `SetUserAttributes(r *http.Request, attrs map[string][]string) *http.Request` — Injects AD attributes into the request context. Like `SetUserGroups`, present values let the LDAP middleware skip its lookup — cache and restore them **together with** the groups so a resumed request never has one without the other.
 
-Use `SetUser` and `SetUserGroups` together to restore a previously authenticated identity from a session store, avoiding re-authentication and LDAP lookups on every request:
+Use `SetUser`, `SetUserGroups` and (if used) `SetUserAttributes` together to restore a previously authenticated identity from a session store, avoiding re-authentication and LDAP lookups on every request:
 
 ```go
 // In your session middleware, before the SSPI middleware runs:
 if sessionUser, ok := getSession(r); ok {
     r = gwim.SetUser(r, sessionUser)
     r = gwim.SetUserGroups(r, sessionUser.Groups)
+    r = gwim.SetUserAttributes(r, sessionUser.Attributes) // if WithLDAPUserAttributes is set
 }
 ```
 

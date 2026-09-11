@@ -16,7 +16,7 @@ import (
 )
 
 // foundUserSearch answers the user-DN search with a single entry and every
-// later search with nothing, so getUserGroups reaches its "user exists, no
+// later search with nothing, so getUserDirectory reaches its "user exists, no
 // memberships" result without needing tokenGroups fixtures.
 func foundUserSearch(groups ...string) func(*ldap.SearchRequest) (*ldap.SearchResult, error) {
 	return func(req *ldap.SearchRequest) (*ldap.SearchResult, error) {
@@ -388,7 +388,7 @@ func TestGroupLookupGroups(t *testing.T) {
 
 		// Calls the pool logic directly: Groups' own pre-flight ctx.Err()
 		// check would otherwise short-circuit before this path is reached.
-		if _, err := g.groups(ctx, "testuser"); !errors.Is(err, context.Canceled) {
+		if _, err := g.directory(ctx, "testuser"); !errors.Is(err, context.Canceled) {
 			t.Fatalf("groups() error = %v, want context.Canceled", err)
 		}
 	})
@@ -419,7 +419,7 @@ func TestGroupLookupGroups(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		if _, err := g.groups(ctx, "testuser"); !errors.Is(err, context.Canceled) {
+		if _, err := g.directory(ctx, "testuser"); !errors.Is(err, context.Canceled) {
 			t.Fatalf("groups() error = %v, want context.Canceled", err)
 		}
 		if n := dials.Load(); n != 1 {
@@ -550,7 +550,7 @@ func TestGroupLookupCloseDuringInFlightLookupClosesConnection(t *testing.T) {
 
 	backgroundDone := make(chan struct{})
 	go func() {
-		g.groups(context.Background(), "testuser")
+		g.directory(context.Background(), "testuser")
 		close(backgroundDone)
 	}()
 	<-dialed // the lookup has dialed and is now blocked inside Search.

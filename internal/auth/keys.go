@@ -10,7 +10,8 @@ package auth
 type contextKey string
 
 const (
-	ContextKeyUserGroups contextKey = "userGroups"
-	ContextKeyUsername   contextKey = "username"
-	ContextKeyConnID     contextKey = "connId"
+	ContextKeyUserGroups     contextKey = "userGroups"
+	ContextKeyUserAttributes contextKey = "userAttributes"
+	ContextKeyUsername       contextKey = "username"
+	ContextKeyConnID         contextKey = "connId"
 )

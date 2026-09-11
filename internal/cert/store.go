@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"strings"
 
 	"github.com/google/certtostore"
 	"golang.org/x/sys/windows"
@@ -153,7 +154,7 @@ func (b *win32CertStoreBackend) GetCertificate(subject string, store CertStore) 
 	signer, err := wcs.CertKey(ctx)
 	if err != nil {
 		wcs.Close()
-		return nil, fmt.Errorf("failed to acquire private key for %q in %s: %w", subject, storeName, err)
+		return nil, fmt.Errorf("failed to acquire private key for %q in %s: %w%s", subject, storeName, err, legacyKeyHint(err))
 	}
 
 	return &CertificateSource{
@@ -163,4 +164,27 @@ func (b *win32CertStoreBackend) GetCertificate(subject string, store CertStore) 
 		},
 		wcs: wcs,
 	}, nil
+}
+
+// legacyKeyHint returns actionable guidance to append to a CertKey error when
+// the error indicates the certificate's private key is held by a legacy
+// CryptoAPI CSP rather than a CNG Key Storage Provider. certtostore only
+// supports CNG keys and surfaces legacy keys with errors such as "CNG key was
+// empty" or "unable to locate CNG key". Returns "" for any other error.
+func legacyKeyHint(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "CNG key was empty") || strings.Contains(msg, "unable to locate CNG key") {
+		return ` (the private key is stored with a legacy CryptoAPI CSP; this` +
+			` library requires a CNG Key Storage Provider key — re-import the PFX` +
+			` with PowerShell Import-PfxCertificate (it targets the CNG "Microsoft` +
+			` Software Key Storage Provider" by default), or re-enroll from a` +
+			` template whose Cryptography setting is "Key Storage Provider", not` +
+			` "Legacy Cryptographic Service Provider". Do not pass certutil -csp a` +
+			` KSP name; that path expects a CSP provider type and fails with` +
+			` NTE_PROV_TYPE_NOT_DEF)`
+	}
+	return ""
 }

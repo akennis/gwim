@@ -71,12 +71,14 @@ func TestCreateChannelBindings(t *testing.T) {
 	}
 }
 
-func TestGetUserGroups(t *testing.T) {
+func TestGetUserDirectory(t *testing.T) {
 	tests := []struct {
 		name        string
 		username    string
+		attrs       []string
 		searchSetup func(m *mockLdapClient)
 		expected    []string
+		wantAttrs   map[string][]string
 		wantErr     bool
 		wantErrIs   error
 	}{
@@ -190,6 +192,43 @@ func TestGetUserGroups(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name:     "RequestedAttributesRideAlong",
+			username: "testuser",
+			attrs:    []string{"mail", "displayName", "distinguishedName"},
+			searchSetup: func(m *mockLdapClient) {
+				m.SearchFunc = func(req *ldap.SearchRequest) (*ldap.SearchResult, error) {
+					if req.Scope == ldap.ScopeWholeSubtree && req.Filter == "(&(sAMAccountName=testuser)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))" {
+						// distinguishedName is always asked for; the extras are
+						// appended once, de-duplicated, in the order given.
+						if want := []string{"distinguishedName", "mail", "displayName"}; !reflect.DeepEqual(req.Attributes, want) {
+							t.Errorf("user search Attributes = %v, want %v", req.Attributes, want)
+						}
+						return &ldap.SearchResult{
+							Entries: []*ldap.Entry{
+								{
+									DN: "CN=testuser,OU=Users,DC=example,DC=com",
+									Attributes: []*ldap.EntryAttribute{
+										{Name: "mail", Values: []string{"real.name@district.example"}},
+										{Name: "displayName", Values: []string{"Real Name"}},
+									},
+								},
+							},
+						}, nil
+					}
+					if req.BaseDN == "CN=testuser,OU=Users,DC=example,DC=com" && req.Scope == ldap.ScopeBaseObject {
+						return &ldap.SearchResult{Entries: []*ldap.Entry{{DN: "CN=testuser,OU=Users,DC=example,DC=com"}}}, nil
+					}
+					return &ldap.SearchResult{}, nil
+				}
+			},
+			expected: []string{},
+			wantAttrs: map[string][]string{
+				"mail":        {"real.name@district.example"},
+				"displayname": {"Real Name"},
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -197,16 +236,20 @@ func TestGetUserGroups(t *testing.T) {
 			m := &mockLdapClient{}
 			tt.searchSetup(m)
 
-			groups, err := getUserGroups(context.Background(), m, "OU=Users,DC=example,DC=com", tt.username)
+			info := LdapServerInfo{UsersDN: "OU=Users,DC=example,DC=com", UserAttributes: tt.attrs}
+			dir, err := getUserDirectory(context.Background(), m, info, tt.username)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("getUserGroups() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("getUserDirectory() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if tt.wantErrIs != nil && !errors.Is(err, tt.wantErrIs) {
-				t.Errorf("getUserGroups() error = %v, want errors.Is(err, %v)", err, tt.wantErrIs)
+				t.Errorf("getUserDirectory() error = %v, want errors.Is(err, %v)", err, tt.wantErrIs)
 			}
-			if !reflect.DeepEqual(groups, tt.expected) {
-				t.Errorf("getUserGroups() = %v, want %v", groups, tt.expected)
+			if !reflect.DeepEqual(dir.groups, tt.expected) {
+				t.Errorf("getUserDirectory() groups = %v, want %v", dir.groups, tt.expected)
+			}
+			if tt.wantAttrs != nil && !reflect.DeepEqual(dir.attributes, tt.wantAttrs) {
+				t.Errorf("getUserDirectory() attributes = %v, want %v", dir.attributes, tt.wantAttrs)
 			}
 		})
 	}
@@ -241,9 +284,9 @@ func TestGetUserGroupsAbortsBeforeBatchSearchWhenContextDone(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := getUserGroups(ctx, m, "OU=Users,DC=example,DC=com", "testuser")
+	_, err := getUserDirectory(ctx, m, LdapServerInfo{UsersDN: "OU=Users,DC=example,DC=com"}, "testuser")
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("getUserGroups() error = %v, want context.Canceled", err)
+		t.Fatalf("getUserDirectory() error = %v, want context.Canceled", err)
 	}
 }
 

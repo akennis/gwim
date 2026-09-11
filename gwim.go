@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -76,6 +77,53 @@ func UserGroups(r *http.Request) ([]string, bool) {
 // Use this to resume a session with cached groups without re-running LDAP.
 func SetUserGroups(r *http.Request, groups []string) *http.Request {
 	ctx := context.WithValue(r.Context(), iauth.ContextKeyUserGroups, groups)
+	return r.WithContext(ctx)
+}
+
+// UserAttributes returns the additional Active Directory attributes fetched for
+// the authenticated user, keyed by a lower-cased attribute name. Populate the
+// set to fetch with WithLDAPUserAttributes. The second return value is false
+// until either the LDAP middleware or SetUserAttributes has run; afterwards it
+// is true even when the map is empty, so "middleware ran" stays distinct from
+// "the user has no such attribute."
+func UserAttributes(r *http.Request) (map[string][]string, bool) {
+	attrs, ok := r.Context().Value(iauth.ContextKeyUserAttributes).(map[string][]string)
+	if !ok {
+		return nil, false
+	}
+	return attrs, true
+}
+
+// UserAttribute returns the first value of one Active Directory attribute
+// fetched for the authenticated user. name is matched case-insensitively. The
+// second return value is false when the attribute was not requested, the
+// directory held no value for it, or the enriching middleware has not run.
+func UserAttribute(r *http.Request, name string) (string, bool) {
+	attrs, ok := UserAttributes(r)
+	if !ok {
+		return "", false
+	}
+	vals := attrs[strings.ToLower(name)]
+	if len(vals) == 0 || vals[0] == "" {
+		return "", false
+	}
+	return vals[0], true
+}
+
+// UserMail returns the authenticated user's mail attribute - their real Active
+// Directory email address. It is shorthand for UserAttribute(r, "mail") and
+// requires "mail" to have been passed to WithLDAPUserAttributes.
+func UserMail(r *http.Request) (string, bool) {
+	return UserAttribute(r, "mail")
+}
+
+// SetUserAttributes injects Active Directory attributes into the request
+// context, keyed as UserAttributes returns them. Use it to resume a session
+// with cached attributes without re-querying the directory; cache and restore
+// them together with the groups from SetUserGroups so a resumed request never
+// carries one without the other.
+func SetUserAttributes(r *http.Request, attrs map[string][]string) *http.Request {
+	ctx := context.WithValue(r.Context(), iauth.ContextKeyUserAttributes, attrs)
 	return r.WithContext(ctx)
 }
 
@@ -165,6 +213,7 @@ type ldapConfig struct {
 	spn         string
 	timeout     time.Duration
 	ttl         time.Duration
+	userAttrs   []string
 	errHandlers AuthErrorHandlers
 }
 
@@ -238,10 +287,24 @@ func WithLDAPErrorHandlers(h AuthErrorHandlers) LDAPOption {
 	}
 }
 
+// WithLDAPUserAttributes requests additional Active Directory attributes for
+// the authenticated user - "mail" and "displayName", for example. They are
+// read by the same directory search that resolves group membership, so there
+// is no extra round trip, and are exposed through UserAttributes, UserAttribute
+// and UserMail on the request context. Cache them into a session alongside
+// groups with SetUserAttributes. An attribute that is unknown or has no value
+// is simply absent from the result.
+func WithLDAPUserAttributes(attrs ...string) LDAPOption {
+	return func(c *ldapConfig) {
+		c.userAttrs = append(c.userAttrs, attrs...)
+	}
+}
+
 // LDAPProvider enriches an authenticated request's context with the user's
-// Active Directory group memberships. Create one with NewLDAPProvider, then
-// register its Middleware method with your router or wrap handlers manually.
-// It must be placed after SSPIProvider in the middleware chain.
+// Active Directory group memberships, and with any attributes named by
+// WithLDAPUserAttributes. Create one with NewLDAPProvider, then register its
+// Middleware method with your router or wrap handlers manually. It must be
+// placed after SSPIProvider in the middleware chain.
 type LDAPProvider struct {
 	lookup *iauth.GroupLookup
 }
@@ -280,6 +343,7 @@ func NewLDAPProvider(opts ...LDAPOption) (*LDAPProvider, error) {
 		ServiceAccountSPN: cfg.spn,
 		Timeout:           cfg.timeout,
 		ConnectionTTL:     cfg.ttl,
+		UserAttributes:    cfg.userAttrs,
 	}
 
 	if err := iauth.ValidateLDAP(ldapServerInfo); err != nil {

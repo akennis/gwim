@@ -71,6 +71,45 @@ type LdapServerInfo struct {
 	Timeout time.Duration
 	// ConnectionTTL is the maximum lifetime of a pooled connection. Zero means no TTL.
 	ConnectionTTL time.Duration
+	// UserAttributes names additional Active Directory attributes to read for
+	// the authenticated user - "mail" and "displayName", for example. They are
+	// fetched by the same user-entry search that group resolution already
+	// performs, so requesting them costs no extra round trip. The values are
+	// surfaced on the request context under ContextKeyUserAttributes, keyed by
+	// a lower-cased attribute name. distinguishedName is always read and need
+	// not be listed here.
+	UserAttributes []string
+}
+
+// userDirectory is the directory data resolved for one authenticated user: the
+// group memberships as distinguished names, and the attributes requested via
+// LdapServerInfo.UserAttributes keyed by a lower-cased name. An attribute the
+// directory held no value for is simply absent from the map; the map itself is
+// non-nil whenever the lookup reached the user entry.
+type userDirectory struct {
+	groups     []string
+	attributes map[string][]string
+}
+
+// extraUserAttributes returns the caller-requested attribute names to add to
+// the user-entry search, trimmed and de-duplicated and with distinguishedName
+// (always requested) removed.
+func extraUserAttributes(names []string) []string {
+	seen := map[string]bool{"distinguishedname": true}
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, name)
+	}
+	return out
 }
 
 // ldapClient defines the subset of ldap.Conn methods used by this package,
@@ -162,31 +201,53 @@ func createChannelBindings(certRaw []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func getUserGroups(ctx context.Context, ldapServiceConn ldapClient, ldapUsersDN string, username string) ([]string, error) {
-	// First, get the user's distinguished name (DN).
+func getUserDirectory(ctx context.Context, ldapServiceConn ldapClient, info LdapServerInfo, username string) (userDirectory, error) {
+	ldapUsersDN := info.UsersDN
+
+	// First, get the user's distinguished name (DN), plus any additional
+	// attributes the caller asked for - they ride along on this one search.
+	extraAttrs := extraUserAttributes(info.UserAttributes)
 	userSearchRequest := ldap.NewSearchRequest(
 		ldapUsersDN,
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
 		// Find the active user by their sAMAccountName.
 		fmt.Sprintf("(&(sAMAccountName=%s)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))", ldap.EscapeFilter(username)),
-		// We only need the distinguishedName.
-		[]string{"distinguishedName"},
+		append([]string{"distinguishedName"}, extraAttrs...),
 		nil,
 	)
 	userSearchResult, err := ldapServiceConn.Search(userSearchRequest)
 	if err != nil {
-		return nil, fmt.Errorf("user search failed for %q: %w", username, err)
+		return userDirectory{}, fmt.Errorf("user search failed for %q: %w", username, err)
 	}
 	if len(userSearchResult.Entries) != 1 {
 		// Zero entries means no such account, or one disabled by the
 		// userAccountControl clause in the filter above. More than one means an
 		// ambiguous sAMAccountName. Neither yields a group set worth trusting,
 		// so both are a definitive deny rather than an empty membership.
-		return nil, fmt.Errorf("%w: %d entries matched %q", ErrUserNotFound, len(userSearchResult.Entries), username)
+		return userDirectory{}, fmt.Errorf("%w: %d entries matched %q", ErrUserNotFound, len(userSearchResult.Entries), username)
 	}
-	userDN := userSearchResult.Entries[0].DN
+	userEntry := userSearchResult.Entries[0]
+	userDN := userEntry.DN
 	if userDN == "" {
-		return nil, fmt.Errorf("%w: empty distinguishedName for %q", ErrUserNotFound, username)
+		return userDirectory{}, fmt.Errorf("%w: empty distinguishedName for %q", ErrUserNotFound, username)
+	}
+
+	// The user entry is in hand; pull the requested attributes off it now so
+	// every return below carries them, group lookup outcome notwithstanding.
+	// Match the directory's returned names case-insensitively - a caller may
+	// ask for "Mail" and get back "mail".
+	attributes := make(map[string][]string, len(extraAttrs))
+	if len(extraAttrs) > 0 {
+		wanted := make(map[string]bool, len(extraAttrs))
+		for _, name := range extraAttrs {
+			wanted[strings.ToLower(name)] = true
+		}
+		for _, attr := range userEntry.Attributes {
+			key := strings.ToLower(attr.Name)
+			if wanted[key] && len(attr.Values) > 0 {
+				attributes[key] = attr.Values
+			}
+		}
 	}
 
 	// Now get the tokenGroups attribute for the user.
@@ -201,15 +262,15 @@ func getUserGroups(ctx context.Context, ldapServiceConn ldapClient, ldapUsersDN 
 	if err != nil {
 		// This can fail if the constructed attribute is not available.
 		// The error from AD is "00002120: SvcErr: DSID-03140594, problem 5012 (DIR_ERROR), data 0"
-		return nil, fmt.Errorf("user search for tokenGroups failed for user DN %q: %w", userDN, err)
+		return userDirectory{}, fmt.Errorf("user search for tokenGroups failed for user DN %q: %w", userDN, err)
 	}
 	if len(tokenGroupsSearchResult.Entries) != 1 {
-		return []string{}, nil
+		return userDirectory{groups: []string{}, attributes: attributes}, nil
 	}
 
 	groupSidsBytes := tokenGroupsSearchResult.Entries[0].GetRawAttributeValues("tokenGroups")
 	if len(groupSidsBytes) == 0 {
-		return []string{}, nil
+		return userDirectory{groups: []string{}, attributes: attributes}, nil
 	}
 
 	// The UserDN might be scoped to an OU (e.g., OU=users,DC=example,DC=com).
@@ -239,7 +300,7 @@ func getUserGroups(ctx context.Context, ldapServiceConn ldapClient, ldapUsersDN 
 		// A caller that has already given up is not worth another batch of
 		// directory load; bail before issuing it rather than after.
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return userDirectory{}, err
 		}
 		end := i + sidBatchSize
 		if end > len(groupSidsBytes) {
@@ -268,7 +329,7 @@ func getUserGroups(ctx context.Context, ldapServiceConn ldapClient, ldapUsersDN 
 		)
 		groupSearchResult, err := ldapServiceConn.Search(groupSearchRequest)
 		if err != nil {
-			return nil, fmt.Errorf("group search by SID failed for user %q: %w", username, err)
+			return userDirectory{}, fmt.Errorf("group search by SID failed for user %q: %w", username, err)
 		}
 		for _, entry := range groupSearchResult.Entries {
 			groups = append(groups, entry.DN)
@@ -276,9 +337,9 @@ func getUserGroups(ctx context.Context, ldapServiceConn ldapClient, ldapUsersDN 
 	}
 
 	if len(groups) == 0 {
-		return []string{}, nil
+		groups = []string{}
 	}
-	return groups, nil
+	return userDirectory{groups: groups, attributes: attributes}, nil
 }
 
 // ldapConnector defines a function type for creating an LDAP connection.
@@ -366,8 +427,9 @@ func (g *GroupLookup) put(conn ldapClient, createdAt time.Time) {
 	}
 }
 
-// groups resolves username's group memberships on a connection taken from the
-// pool, returning that connection to the pool when it is still usable.
+// directory resolves username's group memberships and requested attributes on
+// a connection taken from the pool, returning that connection to the pool when
+// it is still usable.
 //
 // A lookup that fails on a pooled connection is assumed to have hit a stale
 // one, so the connection is closed and the lookup retried exactly once on a
@@ -383,7 +445,7 @@ func (g *GroupLookup) put(conn ldapClient, createdAt time.Time) {
 // directory.
 //
 // Every error wraps ErrLDAPConnection or ErrLDAPLookup.
-func (g *GroupLookup) groups(ctx context.Context, username string) ([]string, error) {
+func (g *GroupLookup) directory(ctx context.Context, username string) (userDirectory, error) {
 	var conn ldapClient
 	var createdAt time.Time
 	fromPool := false
@@ -406,17 +468,17 @@ func (g *GroupLookup) groups(ctx context.Context, username string) ([]string, er
 
 	if conn == nil {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return userDirectory{}, err
 		}
 		var err error
 		conn, err = currentLdapConnector(g.info)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrLDAPConnection, err)
+			return userDirectory{}, fmt.Errorf("%w: %w", ErrLDAPConnection, err)
 		}
 		createdAt = time.Now()
 	}
 
-	userGroups, err := getUserGroups(ctx, conn, g.info.UsersDN, username)
+	dir, err := getUserDirectory(ctx, conn, g.info, username)
 	if err != nil && fromPool && !errors.Is(err, ErrUserNotFound) {
 		// The pooled connection may be stale — close it and retry once with a
 		// freshly dialed connection.
@@ -424,30 +486,30 @@ func (g *GroupLookup) groups(ctx context.Context, username string) ([]string, er
 		conn.Close()
 
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return userDirectory{}, ctxErr
 		}
 		conn, err = currentLdapConnector(g.info)
 		if err != nil {
 			// Preserve both the failure that prompted the retry and the
 			// dial failure that followed it.
-			return nil, fmt.Errorf("%w: %w", ErrLDAPConnection, errors.Join(firstErr, err))
+			return userDirectory{}, fmt.Errorf("%w: %w", ErrLDAPConnection, errors.Join(firstErr, err))
 		}
 		createdAt = time.Now()
 
-		userGroups, err = getUserGroups(ctx, conn, g.info.UsersDN, username)
+		dir, err = getUserDirectory(ctx, conn, g.info, username)
 	}
 
 	switch {
 	case err == nil:
 		g.put(conn, createdAt)
-		return userGroups, nil
+		return dir, nil
 	case errors.Is(err, ErrUserNotFound):
 		// The directory answered, so the connection is still good.
 		g.put(conn, createdAt)
-		return nil, err
+		return userDirectory{}, err
 	default:
 		conn.Close()
-		return nil, fmt.Errorf("%w: %w", ErrLDAPLookup, err)
+		return userDirectory{}, fmt.Errorf("%w: %w", ErrLDAPLookup, err)
 	}
 }
 
@@ -479,19 +541,19 @@ func (g *GroupLookup) Groups(ctx context.Context, username string) ([]string, er
 	}
 
 	type lookup struct {
-		groups []string
-		err    error
+		dir userDirectory
+		err error
 	}
 	// Buffered so an abandoned lookup never blocks its goroutine forever.
 	done := make(chan lookup, 1)
 	go func() {
-		groups, err := g.groups(ctx, username)
-		done <- lookup{groups, err}
+		dir, err := g.directory(ctx, username)
+		done <- lookup{dir, err}
 	}()
 
 	select {
 	case r := <-done:
-		return r.groups, r.err
+		return r.dir.groups, r.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -499,12 +561,17 @@ func (g *GroupLookup) Groups(ctx context.Context, username string) ([]string, er
 
 // Middleware satisfies func(http.Handler) http.Handler. It injects the
 // authenticated caller's group memberships into the request context under
-// ContextKeyUserGroups, and must run after authentication has placed the
-// username under ContextKeyUsername.
+// ContextKeyUserGroups - and, when LdapServerInfo.UserAttributes is set, their
+// requested directory attributes under ContextKeyUserAttributes. It must run
+// after authentication has placed the username under ContextKeyUsername.
 func (g *GroupLookup) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// If groups are already in the context, do nothing.
-		if _, ok := r.Context().Value(ContextKeyUserGroups).([]string); ok {
+		// If the enriched values are already in the context, do nothing. When
+		// attributes are configured, both must be present to skip: a resumed
+		// session that restored only groups still needs the attribute lookup.
+		_, haveGroups := r.Context().Value(ContextKeyUserGroups).([]string)
+		_, haveAttrs := r.Context().Value(ContextKeyUserAttributes).(map[string][]string)
+		if haveGroups && (haveAttrs || len(g.info.UserAttributes) == 0) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -516,14 +583,14 @@ func (g *GroupLookup) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		userGroups, err := g.groups(r.Context(), username)
+		dir, err := g.directory(r.Context(), username)
 		switch {
 		case err == nil:
 		case errors.Is(err, ErrUserNotFound):
 			// An account the directory does not know has no memberships. Let it
 			// through with an empty set so authorization downstream denies it;
 			// a deleted or disabled account is not a server error.
-			userGroups = []string{}
+			dir = userDirectory{groups: []string{}, attributes: map[string][]string{}}
 		case errors.Is(err, ErrLDAPConnection):
 			g.opts.GetOnLdapConnectionError()(w, r, err)
 			return
@@ -532,7 +599,14 @@ func (g *GroupLookup) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), ContextKeyUserGroups, userGroups)
+		ctx := context.WithValue(r.Context(), ContextKeyUserGroups, dir.groups)
+		if len(g.info.UserAttributes) > 0 {
+			attrs := dir.attributes
+			if attrs == nil {
+				attrs = map[string][]string{}
+			}
+			ctx = context.WithValue(ctx, ContextKeyUserAttributes, attrs)
+		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
